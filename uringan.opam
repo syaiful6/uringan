@@ -6,13 +6,17 @@ maintainer: ["Syaiful Bahri"]
 authors: ["Syaiful Bahri"]
 license: "ISC"
 depends: [
-  "ocaml" {>= "4.08.0"}
-  "dune"
+  "ocaml" {>= "5.4.1"}
+  "dune" {>= "3.0"}
+  "cstruct" {>= "6.0.0"}
+  "optint" {>= "0.3.0"}
   "alcotest" {with-test}
+  "ocamlformat" {with-dev-setup}
+  "ocaml-lsp-server" {with-dev-setup}
   "odoc" {with-doc}
 ]
 build: [
-  ["dune" "subst"] {pinned}
+  ["dune" "subst"] {dev}
   [
     "dune"
     "build"

@@ -1,4 +1,4 @@
 (library
  (name uringan)
  (public_name uringan)
- (libraries))
+ (libraries unix cstruct optint))

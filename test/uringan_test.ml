@@ -1,14 +1,11 @@
 open Alcotest
 
-let test_hello_with_name name () =
-  let greeting = Uringan.greet name in
-  let expected = "Hello " ^ name ^ "!" in
-  check string "same string" greeting expected
+let test_poll_mask () =
+  let open Uringan.Poll_mask in
+  let m = pollin + pollout in
+  check bool "pollin in mask" true (mem pollin m);
+  check bool "pollerr not in mask" false (mem pollerr m);
+  check bool "empty in any mask" true (mem empty m)
 
-let suite =
-  [ "can greet Tom", `Quick, test_hello_with_name "Tom"
-  ; "can greet John", `Quick, test_hello_with_name "John"
-  ]
-
-let () =
-  Alcotest.run "uringan" [ "Uringan", suite ]
+let suite = [ "poll mask", `Quick, test_poll_mask ]
+let () = Alcotest.run "uringan" [ "Uringan", suite ]
