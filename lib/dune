@@ -1,0 +1,4 @@
+(library
+ (name uringan)
+ (public_name uringan)
+ (libraries))

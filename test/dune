@@ -1,0 +1,4 @@
+(tests
+ (names uringan_test)
+ (package uringan)
+ (libraries alcotest uringan))
