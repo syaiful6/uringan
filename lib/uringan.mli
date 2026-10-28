@@ -95,8 +95,14 @@ val noop : 'a t -> 'a -> 'a job option
 val now : unit -> int64
 (** [now ()] is the current monotonic time in nanoseconds. *)
 
+val etime : Unix.error
+(** [ETIME], the error a {!timeout} completes with. [Unix.error] has no
+    constructor for it, so this is an [EUNKNOWNERR]. *)
+
 val timeout : ?absolute:bool -> 'a t -> int64 -> 'a -> 'a job option
-(** [timeout t ns d] completes with [ETIME] after [ns] nanoseconds.
+(** [timeout t ns d] completes with [Error etime] once [ns] nanoseconds have
+    passed since it was submitted. Timeouts are kept in user space, and expire
+    during {!wait} or {!get_cqe_nonblocking}, with millisecond resolution.
 
     @param absolute
       if [true], [ns] is a deadline on the {!now} clock rather than a duration
@@ -377,10 +383,16 @@ val recv_msg : 'a t -> Unix.file_descr -> Msghdr.t -> 'a -> 'a job option
 
 (** {3 Cancellation} *)
 
+val ecanceled : Unix.error
+(** [ECANCELED], the error a cancelled operation completes with. [Unix.error]
+    has no constructor for it, so this is an [EUNKNOWNERR]. *)
+
 val cancel : 'a t -> 'a job -> 'a -> 'a job option
-(** [cancel t job d] cancels [job]. Both operations produce a completion: if
-    [job] was still pending it completes with [ECANCELED] and the cancel with
-    [0]; if it had already finished the cancel completes with [ENOENT].
+(** [cancel t job d] cancels [job] on the next {!submit}. Both operations
+    produce a completion: if [job] was still waiting (parked on a descriptor,
+    or a pending {!timeout}) it completes with [Error ecanceled] and the cancel
+    with [0]; if it had already completed, the cancel completes with
+    [Error ENOENT].
 
     @raise Invalid_argument
       if [job]'s completion has already been collected *)
@@ -426,4 +438,5 @@ val sqe_ready : _ t -> int
 module Private : sig
   module Epoll = Epoll
   module Eventfd = Eventfd
+  module Timer_heap = Timer_heap
 end

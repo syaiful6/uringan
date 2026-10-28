@@ -147,3 +147,13 @@ value uringan_poll_flag_in(value v_unit) { (void)v_unit; return Val_int(POLLIN);
 value uringan_poll_flag_out(value v_unit) { (void)v_unit; return Val_int(POLLOUT); }
 value uringan_poll_flag_err(value v_unit) { (void)v_unit; return Val_int(POLLERR); }
 value uringan_poll_flag_hup(value v_unit) { (void)v_unit; return Val_int(POLLHUP); }
+
+value uringan_errno_etime(value v_unit) {
+  (void)v_unit;
+  return Val_int(ETIME);
+}
+
+value uringan_errno_ecanceled(value v_unit) {
+  (void)v_unit;
+  return Val_int(ECANCELED);
+}

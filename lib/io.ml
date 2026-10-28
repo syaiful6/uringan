@@ -40,8 +40,12 @@ external pollerr : unit -> int = "uringan_poll_flag_err"
 external pollhup : unit -> int = "uringan_poll_flag_hup"
 external error_of_errno : int -> Unix.error = "uringan_error_of_errno"
 external eagain : unit -> int = "uringan_errno_eagain"
+external etime : unit -> int = "uringan_errno_etime"
+external ecanceled : unit -> int = "uringan_errno_ecanceled"
 
 let eagain = eagain ()
+let etime = etime ()
+let ecanceled = ecanceled ()
 let iov_max = iov_max ()
 let pollin = pollin ()
 let pollout = pollout ()

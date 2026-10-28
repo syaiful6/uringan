@@ -1,6 +1,7 @@
 open Alcotest
 module Epoll = Uringan.Private.Epoll
 module Eventfd = Uringan.Private.Eventfd
+module Timer_heap = Uringan.Private.Timer_heap
 
 let test_poll_mask () =
   let open Uringan.Poll_mask in
@@ -478,6 +479,157 @@ let test_poll_with_reader () =
   check_events "poller sees data first" 2 Uringan.Poll_mask.pollin (next t);
   check_result "then reader consumes it" 1 (Ok 1) (next t)
 
+let drain_heap h =
+  let rec loop acc =
+    match Timer_heap.pop_expired h Int64.max_int with
+    | Option.None -> List.rev acc
+    | Option.Some v -> loop (v :: acc)
+  in
+  loop []
+
+let test_heap_order () =
+  let h = Timer_heap.create () in
+  let deadlines = List.init 200 (fun i -> i * 7919 mod 211) in
+  List.iter (fun d -> ignore (Timer_heap.add h (Int64.of_int d) d)) deadlines;
+  check int "length" 200 (Timer_heap.length h);
+  check (option int64) "min" (Option.Some 0L) (Timer_heap.min_deadline h);
+  check (list int) "sorted" (List.sort compare deadlines) (drain_heap h);
+  check (option int64) "empty" Option.None (Timer_heap.min_deadline h)
+
+let test_heap_expiry () =
+  let h = Timer_heap.create () in
+  ignore (Timer_heap.add h 10L "a");
+  ignore (Timer_heap.add h 20L "b");
+  check (option string) "not yet" Option.None (Timer_heap.pop_expired h 9L);
+  check
+    (option string)
+    "at deadline"
+    (Option.Some "a")
+    (Timer_heap.pop_expired h 10L);
+  check
+    (option string)
+    "next not yet"
+    Option.None
+    (Timer_heap.pop_expired h 19L)
+
+let test_heap_remove () =
+  let h = Timer_heap.create () in
+  let entries =
+    List.init 50 (fun i -> i, Timer_heap.add h (Int64.of_int (i * 37 mod 53)) i)
+  in
+  let removed, kept = List.partition (fun (i, _) -> i mod 3 = 0) entries in
+  List.iter (fun (_, e) -> Timer_heap.remove h e) removed;
+  List.iter (fun (_, e) -> Timer_heap.remove h e) removed;
+  check int "length" (List.length kept) (Timer_heap.length h);
+  let deadline i = i * 37 mod 53 in
+  let expected =
+    List.map fst kept
+    |> List.sort (fun a b -> compare (deadline a) (deadline b))
+  in
+  check (list int) "remaining in order" expected (drain_heap h)
+
+let ms n = Int64.mul (Int64.of_int n) 1_000_000L
+
+let test_timeout () =
+  with_ring @@ fun t ->
+  let start = Uringan.now () in
+  queue (Uringan.timeout t (ms 20) 1);
+  check_result "expires" 1 (Error Uringan.etime) (next t);
+  check bool "after 20ms" true (Int64.sub (Uringan.now ()) start >= ms 20)
+
+let test_timeout_order () =
+  with_ring @@ fun t ->
+  queue (Uringan.timeout t (ms 30) 1);
+  queue (Uringan.timeout t (ms 10) 2);
+  queue (Uringan.timeout t (ms 20) 3);
+  let order = List.init 3 (fun _ -> fst (next t)) in
+  check (list int) "by deadline" [ 2; 3; 1 ] order
+
+let test_timeout_absolute () =
+  with_ring @@ fun t ->
+  queue (Uringan.timeout ~absolute:true t (Int64.sub (Uringan.now ()) 1L) 1);
+  match Uringan.get_cqe_nonblocking t with
+  | Uringan.None -> fail "past deadline should expire at once"
+  | Uringan.Some { data; result } ->
+    check_result
+      "past deadline"
+      1
+      (Error Uringan.etime)
+      (data, Uringan.Res.int_result result)
+
+let test_wait_shorter_than_timer () =
+  with_ring @@ fun t ->
+  let timer = Option.get (Uringan.timeout t (ms 10_000) 1) in
+  let start = Uringan.now () in
+  expect_none ~timeout:0.02 t;
+  check bool "returned early" true (Int64.sub (Uringan.now ()) start < ms 500);
+  queue (Uringan.cancel t timer 2);
+  check_result "timer" 1 (Error Uringan.ecanceled) (next t);
+  check_result "cancel" 2 (Ok 0) (next t)
+
+let test_cancel_timeout () =
+  with_ring @@ fun t ->
+  let job = Option.get (Uringan.timeout t (ms 10_000) 1) in
+  ignore (Uringan.submit t : int);
+  queue (Uringan.cancel t job 2);
+  check_result "target" 1 (Error Uringan.ecanceled) (next t);
+  check_result "cancel" 2 (Ok 0) (next t);
+  check int "idle" 0 (Uringan.active_ops t)
+
+let test_cancel_parked_read () =
+  with_ring @@ fun t ->
+  with_pipe' @@ fun r w ->
+  let buf = Cstruct.create 1 in
+  let job = Option.get (Uringan.read t ~file_offset:current r buf 1) in
+  expect_none t;
+  queue (Uringan.cancel t job 2);
+  check_result "target" 1 (Error Uringan.ecanceled) (next t);
+  check_result "cancel" 2 (Ok 0) (next t);
+  ignore (Unix.write_substring w "x" 0 1);
+  expect_none t;
+  queue (Uringan.read t ~file_offset:current r buf 3);
+  check_result "later read gets the data" 3 (Ok 1) (next t)
+
+let test_cancel_head_reader () =
+  with_ring @@ fun t ->
+  with_pipe' @@ fun r w ->
+  let a = Cstruct.create 1
+  and b = Cstruct.create 1 in
+  let first = Option.get (Uringan.read t ~file_offset:current r a 1) in
+  queue (Uringan.read t ~file_offset:current r b 2);
+  expect_none t;
+  queue (Uringan.cancel t first 3);
+  check_result "first" 1 (Error Uringan.ecanceled) (next t);
+  check_result "cancel" 3 (Ok 0) (next t);
+  ignore (Unix.write_substring w "x" 0 1);
+  check_result "second read moves up" 2 (Ok 1) (next t);
+  check string "data" "x" (Cstruct.to_string b)
+
+let test_cancel_completed () =
+  with_ring @@ fun t ->
+  let job = Option.get (Uringan.noop t 1) in
+  ignore (Uringan.submit t : int);
+  queue (Uringan.cancel t job 2);
+  check_result "target" 1 (Ok 0) (next t);
+  check_result "too late" 2 (Error Unix.ENOENT) (next t);
+  check_raises
+    "collected"
+    (Invalid_argument "Uringan.cancel: job already collected")
+    (fun () -> ignore (Uringan.cancel t job 3))
+
+let test_exit_with_timer () =
+  let t = Uringan.create ~queue_depth:4 () in
+  let job = Option.get (Uringan.timeout t (ms 10_000) 1) in
+  ignore (Uringan.submit t : int);
+  check_raises
+    "timer in flight"
+    (Invalid_argument "Uringan.exit: 1 operation(s) in flight")
+    (fun () -> Uringan.exit t);
+  queue (Uringan.cancel t job 2);
+  ignore (next t);
+  ignore (next t);
+  Uringan.exit t
+
 let suite =
   [ "poll mask", `Quick, test_poll_mask
   ; "now is monotonic", `Quick, test_now_monotonic
@@ -520,6 +672,21 @@ let ring_suite =
   ; "poll hup", `Quick, test_poll_hup
   ; "poll bad fd", `Quick, test_poll_bad_fd
   ; "poll with reader", `Quick, test_poll_with_reader
+  ; "timeout", `Quick, test_timeout
+  ; "timeout order", `Quick, test_timeout_order
+  ; "timeout absolute", `Quick, test_timeout_absolute
+  ; "wait shorter than timer", `Quick, test_wait_shorter_than_timer
+  ; "cancel timeout", `Quick, test_cancel_timeout
+  ; "cancel parked read", `Quick, test_cancel_parked_read
+  ; "cancel head reader", `Quick, test_cancel_head_reader
+  ; "cancel completed", `Quick, test_cancel_completed
+  ; "exit with timer", `Quick, test_exit_with_timer
+  ]
+
+let heap_suite =
+  [ "order", `Quick, test_heap_order
+  ; "expiry", `Quick, test_heap_expiry
+  ; "remove", `Quick, test_heap_remove
   ]
 
 let () =
@@ -529,4 +696,5 @@ let () =
     ; "Ring", ring_suite
     ; "Epoll", epoll_suite
     ; "Eventfd", eventfd_suite
+    ; "Timer_heap", heap_suite
     ]

@@ -20,6 +20,9 @@ Ring internals (`lib/uringan.ml`): ocaml-uring's `Heap`/`Sketch` are not needed 
 - `sq` holds queued jobs and `cq` holds `(Res.t * 'a)` completions. `in_flight` counts queued, parked and uncollected jobs, and is bounded by `queue_depth`.
 - `parked` maps each fd to FIFO `readers`/`writers` queues. A new job on an fd that already has waiters in the same direction is parked without being attempted, so stream data stays in order. On readiness, only the head of each queue is retried, until one returns `EAGAIN` again. `poll_add` jobs go in a separate `pollers` queue. They consume nothing, so they skip the ordering rule and all of them are rechecked with `poll(2)` (zero timeout) on every event, before readers and writers.
 - epoll registrations are `EPOLLONESHOT`. `armed` tracks interest that has not fired yet; `arm` tries `modify` first and falls back to `add` on `ENOENT`, because registrations outlive the `parked` entry.
+- Each job has a `state` (`Queued`, `Parked`, `Sleeping`, `Completed`, `Collected`) so that `cancel`, which runs at `submit` like other ops, can find and remove its target. Retryable syscalls are a separate `io` type; parked queues hold `{ job; io }`.
+- Timeouts live in `Timer_heap`, a min-heap whose entries know their own index, so cancelled timers are removed in O(log n) instead of lingering. `wait` blocks until the earlier of its own deadline and the earliest timer, rounded up to whole milliseconds, then fires expired timers.
+- `Unix.error` has no `ETIME`/`ECANCELED`; they surface as `EUNKNOWNERR` and are exposed as `Uringan.etime`/`Uringan.ecanceled`.
 - Syscall stubs return the byte count or `-errno` instead of raising, so `EAGAIN` can be detected cheaply (`Io.eagain`).
 
 README usage/install sections and CONTRIBUTING's mention of `bin/` are template leftovers (there is no `bin/` directory, so `make start` will fail).

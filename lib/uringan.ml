@@ -1,6 +1,7 @@
 let todo name = failwith ("Uringan." ^ name ^ ": not implemented")
 
-type op =
+(* A syscall that can be retried until it no longer returns [EAGAIN]. *)
+type io =
   | Noop
   | Read of
       { fd : Unix.file_descr
@@ -28,17 +29,38 @@ type op =
       }
 
 type 'a job =
-  { op : op
+  { op : 'a op
   ; data : 'a
+  ; mutable state : 'a state
+  }
+
+and 'a op =
+  | Io of io
+  | Timeout of
+      { ns : int64
+      ; absolute : bool
+      }
+  | Cancel of 'a job
+
+and 'a state =
+  | Queued
+  | Parked
+  | Sleeping of 'a job Timer_heap.entry
+  | Completed (* In [cq], not yet collected. *)
+  | Collected
+
+type 'a parked =
+  { job : 'a job
+  ; io : io
   }
 
 (* Operations parked on one descriptor, in submission order. Only the head of
    [readers] and [writers] is retried, so a stream is read or written in order.
    [pollers] consume nothing, so all of them are rechecked on every event. *)
 type 'a waiters =
-  { readers : 'a job Queue.t
-  ; writers : 'a job Queue.t
-  ; pollers : 'a job Queue.t
+  { readers : 'a parked Queue.t
+  ; writers : 'a parked Queue.t
+  ; pollers : 'a parked Queue.t
   ; mutable armed : Epoll.Flags.t
     (* The one-shot interest registered with epoll that has not fired yet. *)
   }
@@ -68,8 +90,9 @@ type 'a t =
   ; wakeup : Eventfd.t
   ; queue_depth : int
   ; sq : 'a job Queue.t  (** Queued, not yet attempted. *)
-  ; cq : (Res.t * 'a) Queue.t  (** Completed, not yet collected. *)
+  ; cq : ('a job * Res.t) Queue.t  (** Completed, not yet collected. *)
   ; parked : (Unix.file_descr, 'a waiters) Hashtbl.t
+  ; timers : 'a job Timer_heap.t
   ; mutable in_flight : int
   ; mutable closed : bool
   }
@@ -95,6 +118,7 @@ let create ~queue_depth () =
     ; sq = Queue.create ()
     ; cq = Queue.create ()
     ; parked = Hashtbl.create 16
+    ; timers = Timer_heap.create ()
     ; in_flight = 0
     ; closed = false
     }
@@ -121,13 +145,13 @@ let enqueue t op data =
   if t.in_flight >= t.queue_depth
   then None
   else begin
-    let job = { op; data } in
+    let job = { op; data; state = Queued } in
     Queue.push job t.sq;
     t.in_flight <- t.in_flight + 1;
     Some job
   end
 
-let noop t data = enqueue t Noop data
+let noop t data = enqueue t (Io Noop) data
 
 external now :
    unit
@@ -135,7 +159,11 @@ external now :
   = "uringan_clock_now" "uringan_clock_now_unboxed"
 [@@noalloc]
 
-let timeout ?absolute:_ _ _ _ = todo "timeout"
+let etime = Io.error_of_errno Io.etime
+let ecanceled = Io.error_of_errno Io.ecanceled
+
+let timeout ?(absolute = false) t ns data =
+  enqueue t (Timeout { ns; absolute }) data
 
 module Poll_mask = struct
   type t = int
@@ -150,13 +178,13 @@ module Poll_mask = struct
   let mem x t = x land t = x
 end
 
-let poll_add t fd mask data = enqueue t (Poll { fd; mask }) data
+let poll_add t fd mask data = enqueue t (Io (Poll { fd; mask })) data
 
 let read t ~file_offset fd buf data =
-  enqueue t (Read { fd; file_offset; buf }) data
+  enqueue t (Io (Read { fd; file_offset; buf })) data
 
 let write t ~file_offset fd buf data =
-  enqueue t (Write { fd; file_offset; buf }) data
+  enqueue t (Io (Write { fd; file_offset; buf })) data
 
 let iov_max = Io.iov_max
 
@@ -166,11 +194,11 @@ let check_iov name bufs =
 
 let readv t ~file_offset fd bufs data =
   check_iov "readv" bufs;
-  enqueue t (Readv { fd; file_offset; bufs }) data
+  enqueue t (Io (Readv { fd; file_offset; bufs })) data
 
 let writev t ~file_offset fd bufs data =
   check_iov "writev" bufs;
-  enqueue t (Writev { fd; file_offset; bufs }) data
+  enqueue t (Io (Writev { fd; file_offset; bufs })) data
 
 let openat _ ?dir_fd:_ _ _ _ _ = todo "openat"
 let close _ _ _ = todo "close"
@@ -245,9 +273,14 @@ end
 
 let send_msg ?fds:_ ?dst:_ _ _ _ _ = todo "send_msg"
 let recv_msg _ _ _ _ = todo "recv_msg"
-let cancel _ _ _ = todo "cancel"
 
-(* [perform op] runs the syscall for [op]: a non-negative result or a negative
+let cancel t job data =
+  (match job.state with
+  | Collected -> invalid_arg "Uringan.cancel: job already collected"
+  | Queued | Parked | Sleeping _ | Completed -> ());
+  enqueue t (Cancel job) data
+
+(* [perform io] runs the syscall for [io]: a non-negative result or a negative
    errno. *)
 let perform = function
   | Noop -> 0
@@ -264,7 +297,9 @@ let wait_target = function
   | Write { fd; _ } | Writev { fd; _ } -> Some (fd, `Write)
   | Poll { fd; _ } -> Some (fd, `Poll)
 
-let complete t job res = Queue.push (res, job.data) t.cq
+let complete t job res =
+  job.state <- Completed;
+  Queue.push (job, res) t.cq
 
 let queue_of w = function
   | `Read -> w.readers
@@ -280,8 +315,8 @@ let is_idle w =
    an [interest] is empty exactly when [w] is idle. *)
 let interest w =
   let open Epoll.Flags in
-  let poller job acc =
-    match job.op with
+  let poller p acc =
+    match p.io with
     | Poll { mask; _ } ->
       acc
       + (if Poll_mask.mem Poll_mask.pollin mask then pollin else empty)
@@ -308,7 +343,7 @@ let arm t fd w =
   end
 
 let fail_all t fd w err =
-  let fail job = complete t job (Error err) in
+  let fail p = complete t p.job (Error err) in
   Queue.iter fail w.readers;
   Queue.iter fail w.writers;
   Queue.iter fail w.pollers;
@@ -322,7 +357,7 @@ let rearm t fd w =
     | () -> ()
     | exception Unix.Unix_error (err, _, _) -> fail_all t fd w err
 
-let park t fd dir job =
+let park t fd dir job io =
   let w =
     match Hashtbl.find_opt t.parked fd with
     | Some w -> w
@@ -337,7 +372,8 @@ let park t fd dir job =
       Hashtbl.replace t.parked fd w;
       w
   in
-  Queue.push job (queue_of w dir);
+  job.state <- Parked;
+  Queue.push { job; io } (queue_of w dir);
   rearm t fd w
 
 let has_waiters t fd dir =
@@ -345,38 +381,97 @@ let has_waiters t fd dir =
   | None -> false
   | Some w -> not (Queue.is_empty (queue_of w dir))
 
-let attempt t job =
-  match wait_target job.op with
+let attempt_io t job io =
+  match wait_target io with
   | Some (fd, ((`Read | `Write) as dir)) when has_waiters t fd dir ->
     (* Don't overtake operations already waiting in this direction. *)
-    park t fd dir job
+    park t fd dir job io
   | target ->
-    let n = perform job.op in
+    let n = perform io in
     (match target with
-    | Some (fd, dir) when n = -Io.eagain -> park t fd dir job
+    | Some (fd, dir) when n = -Io.eagain -> park t fd dir job io
     | _ -> complete t job (Res.of_syscall n))
+
+let remove_parked q job =
+  for _ = 1 to Queue.length q do
+    let p = Queue.take q in
+    if p.job != job then Queue.push p q
+  done
+
+let unpark t job =
+  match job.op with
+  | Io io ->
+    Option.iter
+      (fun (fd, dir) ->
+         Option.iter
+           (fun w ->
+              remove_parked (queue_of w dir) job;
+              rearm t fd w)
+           (Hashtbl.find_opt t.parked fd))
+      (wait_target io)
+  | Timeout _ | Cancel _ -> ()
+
+let cancel_job t job target =
+  let cancelled () =
+    complete t target (Error ecanceled);
+    complete t job (Ok 0)
+  in
+  match target.state with
+  | Parked ->
+    unpark t target;
+    cancelled ()
+  | Sleeping e ->
+    Timer_heap.remove t.timers e;
+    cancelled ()
+  | Completed | Collected -> complete t job (Error Unix.ENOENT)
+  | Queued ->
+    (* [target] was queued before [job], so [submit] has already attempted
+       it. *)
+    assert false
+
+let attempt t job =
+  match job.op with
+  | Io io -> attempt_io t job io
+  | Timeout { ns; absolute } ->
+    let deadline = if absolute then ns else Int64.add (now ()) ns in
+    job.state <- Sleeping (Timer_heap.add t.timers deadline job)
+  | Cancel target -> cancel_job t job target
+
+let fire_timers t =
+  if Timer_heap.length t.timers > 0
+  then begin
+    let now = now () in
+    let rec loop () =
+      match Timer_heap.pop_expired t.timers now with
+      | None -> ()
+      | Some job ->
+        complete t job (Error etime);
+        loop ()
+    in
+    loop ()
+  end
 
 (* Retry the head of [q] until one would block again. *)
 let rec retry t q =
   match Queue.peek_opt q with
   | None -> ()
-  | Some job ->
-    let n = perform job.op in
+  | Some p ->
+    let n = perform p.io in
     if n <> -Io.eagain
     then begin
-      ignore (Queue.take q : _ job);
-      complete t job (Res.of_syscall n);
+      ignore (Queue.take q : _ parked);
+      complete t p.job (Res.of_syscall n);
       retry t q
     end
 
 (* Recheck every job in [q], keeping those that would still block in order. *)
 let retry_all t q =
   for _ = 1 to Queue.length q do
-    let job = Queue.take q in
-    let n = perform job.op in
+    let p = Queue.take q in
+    let n = perform p.io in
     if n = -Io.eagain
-    then Queue.push job q
-    else complete t job (Res.of_syscall n)
+    then Queue.push p q
+    else complete t p.job (Res.of_syscall n)
   done
 
 let on_ready t fd flags =
@@ -418,6 +513,28 @@ let submit t =
   done;
   n
 
+(* Epoll takes a C int; longer waits are split up by the [wait] loop. *)
+let max_timeout_ms = 1_000_000_000
+
+let ms_until deadline =
+  let ns = Int64.sub deadline (now ()) in
+  if ns <= 0L
+  then 0
+  else
+    Int64.to_int
+      (Int64.min
+         (Int64.div (Int64.add ns 999_999L) 1_000_000L)
+         (Int64.of_int max_timeout_ms))
+
+(* How long to block: until [deadline] or the earliest timer, if any. *)
+let poll_timeout_ms t deadline =
+  match deadline, Timer_heap.min_deadline t.timers with
+  | None, None -> -1
+  | Some d, None | None, Some d -> ms_until d
+  | Some a, Some b -> ms_until (Int64.min a b)
+
+let expired = function None -> false | Some d -> now () >= d
+
 type 'a completion_option =
   | None
   | Some of
@@ -428,15 +545,10 @@ type 'a completion_option =
 let take_completion t : _ completion_option =
   match Queue.take_opt t.cq with
   | Option.None -> None
-  | Option.Some (result, data) ->
+  | Option.Some (job, result) ->
+    job.state <- Collected;
     t.in_flight <- t.in_flight - 1;
-    Some { result; data }
-
-let ms_until deadline =
-  let ns = Int64.sub deadline (now ()) in
-  if ns <= 0L
-  then 0
-  else Int64.to_int (Int64.div (Int64.add ns 999_999L) 1_000_000L)
+    Some { result; data = job.data }
 
 let wait ?timeout t : _ completion_option =
   ignore (submit t : int);
@@ -444,16 +556,15 @@ let wait ?timeout t : _ completion_option =
     Option.map (fun s -> Int64.add (now ()) (Int64.of_float (s *. 1e9))) timeout
   in
   let rec loop () =
+    fire_timers t;
     if not (Queue.is_empty t.cq)
     then take_completion t
     else begin
-      let timeout_ms =
-        match deadline with Option.None -> -1 | Option.Some d -> ms_until d
-      in
-      let woken = poll t ~timeout_ms in
+      let woken = poll t ~timeout_ms:(poll_timeout_ms t deadline) in
+      fire_timers t;
       if not (Queue.is_empty t.cq)
       then take_completion t
-      else if woken || timeout_ms = 0
+      else if woken || expired deadline
       then None
       else loop ()
     end
@@ -462,7 +573,12 @@ let wait ?timeout t : _ completion_option =
 
 let get_cqe_nonblocking t =
   ignore (submit t : int);
-  if Queue.is_empty t.cq then ignore (poll t ~timeout_ms:0 : bool);
+  fire_timers t;
+  if Queue.is_empty t.cq
+  then begin
+    ignore (poll t ~timeout_ms:0 : bool);
+    fire_timers t
+  end;
   take_completion t
 
 let wakeup t = Eventfd.signal t.wakeup
@@ -472,4 +588,5 @@ let sqe_ready t = Queue.length t.sq
 module Private = struct
   module Epoll = Epoll
   module Eventfd = Eventfd
+  module Timer_heap = Timer_heap
 end

@@ -47,5 +47,8 @@ val pollhup : int
 val eagain : int
 (** [EAGAIN] (equal to [EWOULDBLOCK] on supported platforms). *)
 
+val etime : int
+val ecanceled : int
+
 val error_of_errno : int -> Unix.error
 (** [error_of_errno e] converts the positive errno [e]. *)
