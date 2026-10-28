@@ -414,3 +414,10 @@ val active_ops : _ t -> int
 
 val sqe_ready : _ t -> int
 (** [sqe_ready t] is the number of operations queued but not yet submitted. *)
+
+(**/**)
+
+(** Internal modules, exposed for testing only. *)
+module Private : sig
+  module Epoll = Epoll
+end

@@ -14,6 +14,8 @@ uringan is an OCaml library providing an io_uring-style I/O completion interface
 - io_uring-only features (fixed buffers/`Region`, setup/rw flags, `openat2`, `statx`, `splice`, `fallocate`, probing, `register_eventfd`) are intentionally omitted; `wakeup` replaces `register_eventfd`.
 - Target runtime is OCaml >= 5.4.1. Linux and macOS/BSD only (no Windows).
 
+C stubs live in `lib/*_stubs.c` (compiled with `-Wall -Wextra -Werror`) behind thin internal OCaml modules (e.g. `lib/epoll.ml`), which `Uringan.Private` re-exports so tests can reach them. `epoll_stubs.c` is Linux-only and not yet guarded, so the library does not build on macOS until the kqueue backend and platform selection exist. Blocking stubs release the runtime lock, so buffers they write to must live outside the OCaml heap (custom block or bigarray).
+
 README usage/install sections and CONTRIBUTING's mention of `bin/` are template leftovers (there is no `bin/` directory, so `make start` will fail).
 
 ## Commands

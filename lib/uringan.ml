@@ -24,7 +24,13 @@ let queue_depth _ = todo "queue_depth"
 let exit _ = todo "exit"
 let backend _ = todo "backend"
 let noop _ _ = todo "noop"
-let now () = todo "now"
+
+external now :
+   unit
+  -> (int64[@unboxed])
+  = "uringan_clock_now" "uringan_clock_now_unboxed"
+[@@noalloc]
+
 let timeout ?absolute:_ _ _ _ = todo "timeout"
 
 module Poll_mask = struct
@@ -133,3 +139,7 @@ let get_cqe_nonblocking _ = todo "get_cqe_nonblocking"
 let wakeup _ = todo "wakeup"
 let active_ops _ = todo "active_ops"
 let sqe_ready _ = todo "sqe_ready"
+
+module Private = struct
+  module Epoll = Epoll
+end
