@@ -112,6 +112,10 @@ module Poll_mask : sig
   val pollout : t
   val pollerr : t
   val pollhup : t
+
+  val of_int : int -> t
+  (** [of_int n] reads a {!poll_add} result as a mask. *)
+
   val ( + ) : t -> t -> t
 
   val mem : t -> t -> bool

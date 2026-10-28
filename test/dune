@@ -1,4 +1,4 @@
 (tests
  (names uringan_test)
  (package uringan)
- (libraries alcotest uringan))
+ (libraries alcotest fmt cstruct optint unix uringan))

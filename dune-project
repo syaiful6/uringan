@@ -22,6 +22,7 @@
   (cstruct (>= 6.0.0))
   (optint (>= 0.3.0))
   (alcotest :with-test)
+  (fmt :with-test)
   (ocamlformat :with-dev-setup)
   (ocaml-lsp-server :with-dev-setup)
   (odoc :with-doc)))

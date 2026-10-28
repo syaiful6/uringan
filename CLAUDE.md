@@ -16,6 +16,12 @@ uringan is an OCaml library providing an io_uring-style I/O completion interface
 
 C stubs live in `lib/*_stubs.c` (compiled with `-Wall -Wextra -Werror`) behind thin internal OCaml modules (e.g. `lib/epoll.ml`), which `Uringan.Private` re-exports so tests can reach them. `epoll_stubs.c` is Linux-only and not yet guarded, so the library does not build on macOS until the kqueue backend and platform selection exist. Blocking stubs release the runtime lock, so buffers they write to must live outside the OCaml heap (custom block or bigarray).
 
+Ring internals (`lib/uringan.ml`): ocaml-uring's `Heap`/`Sketch` are not needed because no OCaml memory is handed to the kernel across calls. Instead:
+- `sq` holds queued jobs and `cq` holds `(Res.t * 'a)` completions. `in_flight` counts queued, parked and uncollected jobs, and is bounded by `queue_depth`.
+- `parked` maps each fd to FIFO `readers`/`writers` queues. A new job on an fd that already has waiters in the same direction is parked without being attempted, so stream data stays in order. On readiness, only the head of each queue is retried, until one returns `EAGAIN` again. `poll_add` jobs go in a separate `pollers` queue. They consume nothing, so they skip the ordering rule and all of them are rechecked with `poll(2)` (zero timeout) on every event, before readers and writers.
+- epoll registrations are `EPOLLONESHOT`. `armed` tracks interest that has not fired yet; `arm` tries `modify` first and falls back to `add` on `ENOENT`, because registrations outlive the `parked` entry.
+- Syscall stubs return the byte count or `-errno` instead of raising, so `EAGAIN` can be detected cheaply (`Io.eagain`).
+
 README usage/install sections and CONTRIBUTING's mention of `bin/` are template leftovers (there is no `bin/` directory, so `make start` will fail).
 
 ## Commands
