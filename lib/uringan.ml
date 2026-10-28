@@ -1,6 +1,12 @@
 let todo name = failwith ("Uringan." ^ name ^ ": not implemented")
 
-type 'a t = unit
+type 'a t =
+  { epoll : Epoll.t
+  ; wakeup : Eventfd.t
+  ; queue_depth : int
+  ; mutable closed : bool
+  }
+
 type 'a job = unit
 
 module Res = struct
@@ -19,10 +25,32 @@ module Res = struct
     | Error e -> Format.pp_print_string ppf (Unix.error_message e)
 end
 
-let create ~queue_depth:_ () = todo "create"
-let queue_depth _ = todo "queue_depth"
-let exit _ = todo "exit"
-let backend _ = todo "backend"
+let create ~queue_depth () =
+  if queue_depth <= 0 then invalid_arg "Uringan.create: queue_depth <= 0";
+  let epoll = Epoll.create () in
+  match Eventfd.create () with
+  | exception e ->
+    Epoll.close epoll;
+    raise e
+  | wakeup ->
+    (try Epoll.add epoll (wakeup :> Unix.file_descr) Epoll.Flags.pollin with
+    | e ->
+      Eventfd.close wakeup;
+      Epoll.close epoll;
+      raise e);
+    { epoll; wakeup; queue_depth; closed = false }
+
+let queue_depth t = t.queue_depth
+
+let exit t =
+  if not t.closed
+  then begin
+    t.closed <- true;
+    Eventfd.close t.wakeup;
+    Epoll.close t.epoll
+  end
+
+let backend _ = `Epoll
 let noop _ _ = todo "noop"
 
 external now :
@@ -136,10 +164,11 @@ type 'a completion_option =
 
 let wait ?timeout:_ _ = todo "wait"
 let get_cqe_nonblocking _ = todo "get_cqe_nonblocking"
-let wakeup _ = todo "wakeup"
+let wakeup t = Eventfd.signal t.wakeup
 let active_ops _ = todo "active_ops"
 let sqe_ready _ = todo "sqe_ready"
 
 module Private = struct
   module Epoll = Epoll
+  module Eventfd = Eventfd
 end

@@ -64,6 +64,7 @@ val create : queue_depth:int -> unit -> 'a t
     completed but not yet collected); operations beyond it are refused, giving
     backpressure.
 
+    @raise Invalid_argument if [queue_depth <= 0]
     @raise Unix.Unix_error if the backend cannot be created *)
 
 val queue_depth : _ t -> int
@@ -420,4 +421,5 @@ val sqe_ready : _ t -> int
 (** Internal modules, exposed for testing only. *)
 module Private : sig
   module Epoll = Epoll
+  module Eventfd = Eventfd
 end

@@ -1,5 +1,6 @@
 open Alcotest
 module Epoll = Uringan.Private.Epoll
+module Eventfd = Uringan.Private.Eventfd
 
 let test_poll_mask () =
   let open Uringan.Poll_mask in
@@ -97,9 +98,65 @@ let test_events_bounds () =
     (Invalid_argument "Epoll.Events.create")
     (fun () -> ignore (Epoll.Events.create 0))
 
+let test_ring_lifecycle () =
+  let t = Uringan.create ~queue_depth:16 () in
+  check int "queue_depth" 16 (Uringan.queue_depth t);
+  check bool "backend" true (Uringan.backend t = `Epoll);
+  Uringan.exit t;
+  Uringan.exit t;
+  check_raises
+    "non-positive queue_depth"
+    (Invalid_argument "Uringan.create: queue_depth <= 0")
+    (fun () -> ignore (Uringan.create ~queue_depth:0 ()))
+
+let with_eventfd f =
+  let efd = Eventfd.create () in
+  Fun.protect ~finally:(fun () -> Eventfd.close efd) (fun () -> f efd)
+
+let test_eventfd_drain () =
+  with_eventfd @@ fun efd ->
+  check bool "not signalled" false (Eventfd.drain efd);
+  Eventfd.signal efd;
+  Eventfd.signal efd;
+  check bool "signalled" true (Eventfd.drain efd);
+  check bool "signals collapsed" false (Eventfd.drain efd)
+
+let test_eventfd_wakes_epoll () =
+  with_eventfd @@ fun efd ->
+  let ep = Epoll.create () in
+  let events = Epoll.Events.create 1 in
+  Epoll.add ep (efd :> Unix.file_descr) Epoll.Flags.pollin;
+  check int "idle" 0 (Epoll.wait ep events ~timeout_ms:0);
+  Eventfd.signal efd;
+  check int "woken" 1 (Epoll.wait ep events ~timeout_ms:0);
+  check int "stays readable" 1 (Epoll.wait ep events ~timeout_ms:0);
+  ignore (Eventfd.drain efd);
+  check int "idle after drain" 0 (Epoll.wait ep events ~timeout_ms:0);
+  Epoll.close ep
+
+let test_eventfd_cross_domain () =
+  with_eventfd @@ fun efd ->
+  let ep = Epoll.create () in
+  Epoll.add ep (efd :> Unix.file_descr) Epoll.Flags.pollin;
+  let waiter =
+    Domain.spawn (fun () ->
+      Epoll.wait ep (Epoll.Events.create 1) ~timeout_ms:5000)
+  in
+  Unix.sleepf 0.02;
+  let start = Uringan.now () in
+  Eventfd.signal efd;
+  check int "woken from other domain" 1 (Domain.join waiter);
+  check
+    bool
+    "woke promptly"
+    true
+    (Int64.sub (Uringan.now ()) start < 1_000_000_000L);
+  Epoll.close ep
+
 let suite =
   [ "poll mask", `Quick, test_poll_mask
   ; "now is monotonic", `Quick, test_now_monotonic
+  ; "ring lifecycle", `Quick, test_ring_lifecycle
   ]
 
 let epoll_suite =
@@ -111,4 +168,13 @@ let epoll_suite =
   ; "events bounds", `Quick, test_events_bounds
   ]
 
-let () = Alcotest.run "uringan" [ "Uringan", suite; "Epoll", epoll_suite ]
+let eventfd_suite =
+  [ "drain", `Quick, test_eventfd_drain
+  ; "wakes epoll", `Quick, test_eventfd_wakes_epoll
+  ; "cross domain", `Quick, test_eventfd_cross_domain
+  ]
+
+let () =
+  Alcotest.run
+    "uringan"
+    [ "Uringan", suite; "Epoll", epoll_suite; "Eventfd", eventfd_suite ]
