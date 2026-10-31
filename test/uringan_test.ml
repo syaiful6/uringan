@@ -630,6 +630,230 @@ let test_exit_with_timer () =
   ignore (next t);
   Uringan.exit t
 
+(* Run one operation and return its result. *)
+let run t op =
+  queue (op t 0);
+  match Uringan.wait ~timeout:1.0 t with
+  | Uringan.None -> fail "no completion"
+  | Uringan.Some { result; data = _ } -> result
+
+let ok msg t op =
+  check (result int unix_error) msg (Ok 0) (Uringan.Res.int_result (run t op))
+
+let new_socket t domain ty =
+  Uringan.Res.fd_exn (run t (fun t -> Uringan.socket t domain ty 0)) "socket" ""
+
+let loopback = Unix.ADDR_INET (Unix.inet_addr_loopback, 0)
+
+(* Collect [n] completions, sorted by user data. *)
+let collect t n =
+  List.sort
+    (fun (a, _) (b, _) -> compare a b)
+    (List.init n (fun _ ->
+       match Uringan.wait ~timeout:1.0 t with
+       | Uringan.None -> fail "no completion"
+       | Uringan.Some { result; data } -> data, result))
+
+let closing fds f = Fun.protect ~finally:(fun () -> List.iter Unix.close fds) f
+
+(* A listening TCP socket on an ephemeral loopback port, and its address. *)
+let with_listener t f =
+  let l = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
+  closing [ l ] @@ fun () ->
+  ok "bind" t (fun t -> Uringan.bind t l loopback);
+  ok "listen" t (fun t -> Uringan.listen t l 8);
+  f l (Unix.getsockname l)
+
+let test_socket_nonblocking () =
+  with_ring @@ fun t ->
+  with_listener t @@ fun l _ ->
+  (* A blocking socket would hang here. *)
+  check_raises
+    "accept"
+    (Unix.Unix_error (Unix.EAGAIN, "accept", ""))
+    (fun () -> ignore (Unix.accept l))
+
+let test_tcp () =
+  with_ring @@ fun t ->
+  with_listener t @@ fun l addr ->
+  let c = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
+  closing [ c ] @@ fun () ->
+  let peer = Uringan.Sockaddr.create () in
+  queue (Uringan.accept t l peer 1);
+  queue (Uringan.connect t c addr 2);
+  match collect t 2 with
+  | [ (1, accepted); (2, connected) ] ->
+    check
+      (result int unix_error)
+      "connect"
+      (Ok 0)
+      (Uringan.Res.int_result connected);
+    let s = Uringan.Res.fd_exn accepted "accept" "" in
+    closing [ s ] @@ fun () ->
+    check
+      bool
+      "peer is client"
+      true
+      (Uringan.Sockaddr.get peer = Unix.getsockname c);
+    (* Receive first, so it parks until the send arrives. *)
+    let buf = Cstruct.create 16 in
+    queue (Uringan.recv_msg t s (Uringan.Msghdr.create [ buf ]) 3);
+    expect_none t;
+    queue
+      (Uringan.send_msg
+         t
+         c
+         [ Cstruct.of_string "hello "; Cstruct.of_string "world" ]
+         4);
+    (match collect t 2 with
+    | [ (3, received); (4, sent) ] ->
+      check (result int unix_error) "sent" (Ok 11) (Uringan.Res.int_result sent);
+      check
+        (result int unix_error)
+        "received"
+        (Ok 11)
+        (Uringan.Res.int_result received);
+      check
+        string
+        "data"
+        "hello world"
+        (Cstruct.to_string (Cstruct.sub buf 0 11))
+    | _ -> fail "unexpected completions");
+    ok "shutdown" t (fun t -> Uringan.shutdown t c Unix.SHUTDOWN_SEND);
+    queue (Uringan.read t ~file_offset:current s buf 5);
+    check_result "eof after shutdown" 5 (Ok 0) (next t)
+  | _ -> fail "unexpected completions"
+
+let test_connect_refused () =
+  with_ring @@ fun t ->
+  (* Bound but not listening, so the port is ours and refuses connections. *)
+  let l = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
+  let c = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
+  closing [ l; c ] @@ fun () ->
+  ok "bind" t (fun t -> Uringan.bind t l loopback);
+  queue (Uringan.connect t c (Unix.getsockname l) 1);
+  check_result "refused" 1 (Error Unix.ECONNREFUSED) (next t)
+
+let test_connect_unix_missing () =
+  with_ring @@ fun t ->
+  let c = new_socket t Unix.PF_UNIX Unix.SOCK_STREAM in
+  closing [ c ] @@ fun () ->
+  let path =
+    Filename.concat (Filename.get_temp_dir_name ()) "uringan-missing"
+  in
+  queue (Uringan.connect t c (Unix.ADDR_UNIX path) 1);
+  check_result "fails immediately" 1 (Error Unix.ENOENT) (next t)
+
+let test_bad_address () =
+  with_ring @@ fun t ->
+  let fd = new_socket t Unix.PF_UNIX Unix.SOCK_STREAM in
+  closing [ fd ] @@ fun () ->
+  match Uringan.bind t fd (Unix.ADDR_UNIX (String.make 200 'x')) 1 with
+  | exception Unix.Unix_error _ ->
+    check int "nothing queued" 0 (Uringan.sqe_ready t)
+  | _ -> fail "expected Unix_error"
+
+let socketpair () =
+  let a, b = Unix.socketpair ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.set_nonblock a;
+  Unix.set_nonblock b;
+  a, b
+
+let test_pass_fd () =
+  with_ring @@ fun t ->
+  let a, b = socketpair () in
+  let r, w = pipe () in
+  closing [ a; b; r; w ] @@ fun () ->
+  let buf = Cstruct.create 4 in
+  let msg = Uringan.Msghdr.create ~n_fds:2 [ buf ] in
+  queue (Uringan.recv_msg t b msg 1);
+  queue (Uringan.send_msg ~fds:[ w ] t a [ Cstruct.of_string "fd" ] 2);
+  (match collect t 2 with
+  | [ (1, received); (2, sent) ] ->
+    check (result int unix_error) "sent" (Ok 2) (Uringan.Res.int_result sent);
+    check
+      (result int unix_error)
+      "received"
+      (Ok 2)
+      (Uringan.Res.int_result received)
+  | _ -> fail "unexpected completions");
+  match Uringan.Msghdr.get_fds msg with
+  | [ w' ] ->
+    closing [ w' ] @@ fun () ->
+    check bool "a new descriptor" true (w' <> w);
+    ignore (Unix.write_substring w' "via" 0 3);
+    let b = Bytes.create 3 in
+    ignore (Unix.read r b 0 3);
+    check string "written through it" "via" (Bytes.to_string b)
+  | fds -> failf "expected one descriptor, got %d" (List.length fds)
+
+let test_udp () =
+  with_ring @@ fun t ->
+  let s = new_socket t Unix.PF_INET Unix.SOCK_DGRAM in
+  let c = new_socket t Unix.PF_INET Unix.SOCK_DGRAM in
+  closing [ s; c ] @@ fun () ->
+  ok "bind" t (fun t -> Uringan.bind t s loopback);
+  let buf = Cstruct.create 8 in
+  let from = Uringan.Sockaddr.create () in
+  check_raises
+    "no address yet"
+    (Invalid_argument "Uringan.Sockaddr.get: no address stored")
+    (fun () -> ignore (Uringan.Sockaddr.get from));
+  queue (Uringan.recv_msg t s (Uringan.Msghdr.create ~addr:from [ buf ]) 1);
+  expect_none t;
+  queue
+    (Uringan.send_msg
+       ~dst:(Unix.getsockname s)
+       t
+       c
+       [ Cstruct.of_string "ping" ]
+       2);
+  (match collect t 2 with
+  | [ (1, received); (2, sent) ] ->
+    check (result int unix_error) "sent" (Ok 4) (Uringan.Res.int_result sent);
+    check
+      (result int unix_error)
+      "received"
+      (Ok 4)
+      (Uringan.Res.int_result received)
+  | _ -> fail "unexpected completions");
+  check string "data" "ping" (Cstruct.to_string (Cstruct.sub buf 0 4));
+  (* [c] is unbound, so its own name has a wildcard host. *)
+  match Uringan.Sockaddr.get from, Unix.getsockname c with
+  | Unix.ADDR_INET (host, port), Unix.ADDR_INET (_, port') ->
+    check bool "sender host" true (host = Unix.inet_addr_loopback);
+    check int "sender port" port' port
+  | (Unix.ADDR_INET _ | Unix.ADDR_UNIX _), (Unix.ADDR_INET _ | Unix.ADDR_UNIX _)
+    ->
+    fail "expected inet addresses"
+
+let test_accept_in_order () =
+  with_ring @@ fun t ->
+  with_listener t @@ fun l addr ->
+  let peers = List.init 3 (fun _ -> Uringan.Sockaddr.create ()) in
+  List.iteri (fun i p -> queue (Uringan.accept t l p i)) peers;
+  expect_none t;
+  let clients =
+    List.init 3 (fun _ ->
+      Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0)
+  in
+  closing clients @@ fun () ->
+  (* Connect one at a time, so each accept gets a known client. *)
+  List.iteri
+    (fun i c ->
+       Unix.connect c addr;
+       match Uringan.wait ~timeout:1.0 t with
+       | Uringan.None -> fail "no completion"
+       | Uringan.Some { result; data } ->
+         Unix.close (Uringan.Res.fd_exn result "accept" "");
+         check int "accepts complete in order" i data;
+         check
+           bool
+           "peer"
+           true
+           (Uringan.Sockaddr.get (List.nth peers i) = Unix.getsockname c))
+    clients
+
 let suite =
   [ "poll mask", `Quick, test_poll_mask
   ; "now is monotonic", `Quick, test_now_monotonic
@@ -683,6 +907,17 @@ let ring_suite =
   ; "exit with timer", `Quick, test_exit_with_timer
   ]
 
+let socket_suite =
+  [ "non-blocking", `Quick, test_socket_nonblocking
+  ; "tcp", `Quick, test_tcp
+  ; "connect refused", `Quick, test_connect_refused
+  ; "connect unix missing", `Quick, test_connect_unix_missing
+  ; "bad address", `Quick, test_bad_address
+  ; "pass fd", `Quick, test_pass_fd
+  ; "udp", `Quick, test_udp
+  ; "accept in order", `Quick, test_accept_in_order
+  ]
+
 let heap_suite =
   [ "order", `Quick, test_heap_order
   ; "expiry", `Quick, test_heap_expiry
@@ -694,6 +929,7 @@ let () =
     "uringan"
     [ "Uringan", suite
     ; "Ring", ring_suite
+    ; "Socket", socket_suite
     ; "Epoll", epoll_suite
     ; "Eventfd", eventfd_suite
     ; "Timer_heap", heap_suite

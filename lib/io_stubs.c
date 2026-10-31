@@ -12,6 +12,8 @@
 #include <caml/signals.h>
 #include <caml/unixsupport.h>
 
+#include "uringan_stubs.h"
+
 /* Read/write stubs return the byte count, or -errno on failure, so the caller
    can tell EAGAIN apart without an exception. A [file_offset] of -1 means the
    current position (read/write); otherwise pread/pwrite is used.
@@ -71,7 +73,7 @@ value uringan_errno_eagain(value v_unit) {
 }
 
 /* Fill [iov] from a list of [n] Cstruct.t records {buffer; off; len}. */
-static void iov_of_cstructs(value v_bufs, struct iovec *iov, int n) {
+void uringan_iov_of_cstructs(value v_bufs, struct iovec *iov, int n) {
   for (int i = 0; i < n; i++, v_bufs = Field(v_bufs, 1)) {
     value v_cs = Field(v_bufs, 0);
     iov[i].iov_base =
@@ -90,7 +92,7 @@ value uringan_readv(value v_fd, value v_bufs, value v_n, value v_file_offset) {
   ssize_t r;
   int err;
 
-  iov_of_cstructs(v_bufs, iov, n);
+  uringan_iov_of_cstructs(v_bufs, iov, n);
   caml_enter_blocking_section();
   do
     r = file_offset < 0 ? readv(fd, iov, n) : preadv(fd, iov, n, file_offset);
@@ -111,7 +113,7 @@ value uringan_writev(value v_fd, value v_bufs, value v_n,
   ssize_t r;
   int err;
 
-  iov_of_cstructs(v_bufs, iov, n);
+  uringan_iov_of_cstructs(v_bufs, iov, n);
   caml_enter_blocking_section();
   do
     r = file_offset < 0 ? writev(fd, iov, n)

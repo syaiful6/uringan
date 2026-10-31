@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 uringan is an OCaml library providing an io_uring-style I/O completion interface implemented on top of epoll (Linux) and kqueue (macOS/BSD). Reads and writes are performed in user space once readiness is reported, so callers see completion semantics rather than readiness semantics. Design reference: https://tigerbeetle.com/blog/2022-11-23-a-friendly-abstraction-over-iouring-and-kqueue/. The API should mirror the existing [ocaml-uring](https://github.com/ocaml-multicore/ocaml-uring) bindings where practical; the long-term goal is to back an Eio scheduler.
 
-`lib/uringan.mli` holds the designed interface; `lib/uringan.ml` is a stub where almost everything raises `Failure "... not implemented"`. Execution model (documented at the top of the `.mli`): operations are queued, attempted eagerly and non-blocking on `submit`; `EAGAIN` parks them on the fd until epoll/kqueue readiness; regular-file and metadata ops run synchronously; timeouts live in a user-space timer heap. Deliberate design decisions:
+`lib/uringan.mli` holds the designed interface; `lib/uringan.ml` implements it; the remaining file/metadata ops (`openat`, `close`, `fsync`, `Stat`/`fstatat`, ...) still raise `Failure "... not implemented"`. Execution model (documented at the top of the `.mli`): operations are queued, attempted eagerly and non-blocking on `submit`; `EAGAIN` parks them on the fd until epoll/kqueue readiness; regular-file and metadata ops run synchronously; timeouts live in a user-space timer heap. Deliberate design decisions:
 
 - Callers must set `O_NONBLOCK` on sockets/pipes themselves; `socket`/`accept` return non-blocking fds.
 - `file_offset = Optint.Int63.minus_one` means current position and is required for non-seekable fds (unlike ocaml-uring, which uses zero for sockets).
@@ -23,6 +23,7 @@ Ring internals (`lib/uringan.ml`): ocaml-uring's `Heap`/`Sketch` are not needed 
 - Each job has a `state` (`Queued`, `Parked`, `Sleeping`, `Completed`, `Collected`) so that `cancel`, which runs at `submit` like other ops, can find and remove its target. Retryable syscalls are a separate `io` type; parked queues hold `{ job; io }`.
 - Timeouts live in `Timer_heap`, a min-heap whose entries know their own index, so cancelled timers are removed in O(log n) instead of lingering. `wait` blocks until the earlier of its own deadline and the earliest timer, rounded up to whole milliseconds, then fires expired timers.
 - `Unix.error` has no `ETIME`/`ECANCELED`; they surface as `EUNKNOWNERR` and are exposed as `Uringan.etime`/`Uringan.ecanceled`.
+- Socket syscalls live in `lib/socket_stubs.c` behind `lib/sock.ml`. `socket`/`bind`/`listen`/`shutdown` are `Sync` closures, run once at submit and never parked. A `connect` that returns `EINPROGRESS` parks as a writer under a different io, `Connect_finish`, which polls and then reads `SO_ERROR`. That is why `Parked` records the fd and queue it waits in, instead of deriving them from `job.op`. Sockaddrs are encoded into `bytes` at enqueue time using OCaml's `caml_unix_get_sockaddr`. `Sockaddr.t` and `Msghdr.t` are records whose layout `socket_stubs.c` reads and writes directly, so keep the two in sync.
 - Syscall stubs return the byte count or `-errno` instead of raising, so `EAGAIN` can be detected cheaply (`Io.eagain`).
 
 README usage/install sections and CONTRIBUTING's mention of `bin/` are template leftovers (there is no `bin/` directory, so `make start` will fail).
@@ -45,6 +46,6 @@ Run a single alcotest case: `opam exec -- dune exec test/uringan_test.exe -- tes
 
 - Public API is defined in `lib/uringan.mli` with odoc comments; keep `.ml` and `.mli` in sync.
 - Dev profile (root `dune`) enables all warnings (`+A` minus 42/44/48) and treats them as errors except deprecation (3), so unused values/variables break the build.
-- ocamlformat is pinned to 0.18.0 (`.ocamlformat`, conventional profile); CI checks formatting with `make fmt` on Ubuntu.
+- ocamlformat options are in `.ocamlformat` (no version pin; the local switch has 0.29.0). Run `opam exec -- dune fmt` before committing; CI checks formatting with `make fmt` on Ubuntu.
 - `.github/workflows/ci.yml` still targets OCaml 4.12 and Windows and needs updating to match `dune-project`. Tests have a 1-minute timeout in CI.
 - `uringan.opam` is generated from `dune-project` (`generate_opam_files true`) — edit `dune-project`, not the opam file.

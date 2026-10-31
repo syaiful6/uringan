@@ -310,7 +310,13 @@ val fstatat :
 (** [fstatat t ?fd ~follow path stat d] stores the status of [path] in [stat].
     If [path] is [""], [fd] itself is examined. *)
 
-(** {3 Sockets} *)
+(** {3 Sockets}
+
+    {!socket}, {!bind}, {!listen} and {!shutdown} run synchronously. Addresses
+    passed to {!bind}, {!connect} and {!send_msg} are converted when the
+    operation is queued, so an invalid one (such as a Unix domain path that is
+    too long) raises [Unix.Unix_error] immediately rather than completing with
+    an error. *)
 
 val socket :
    ?cloexec:bool
@@ -377,7 +383,10 @@ val send_msg :
   -> 'a
   -> 'a job option
 (** [send_msg ?fds ?dst t fd bufs d] sends [bufs] and [fds] (via
-    [SCM_RIGHTS]) on [fd], to [dst] if given. *)
+    [SCM_RIGHTS]) on [fd], to [dst] if given. Sending on a socket whose peer
+    has closed completes with [Error EPIPE] instead of raising [SIGPIPE].
+
+    Requires [List.length bufs <= iov_max]. *)
 
 val recv_msg : 'a t -> Unix.file_descr -> Msghdr.t -> 'a -> 'a job option
 

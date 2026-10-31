@@ -3,6 +3,7 @@ let todo name = failwith ("Uringan." ^ name ^ ": not implemented")
 (* A syscall that can be retried until it no longer returns [EAGAIN]. *)
 type io =
   | Noop
+  | Sync of (unit -> int) (* Never blocks or parks. *)
   | Read of
       { fd : Unix.file_descr
       ; file_offset : Optint.Int63.t
@@ -27,6 +28,32 @@ type io =
       { fd : Unix.file_descr
       ; mask : int
       }
+  | Connect of
+      { fd : Unix.file_descr
+      ; addr : Sock.addr
+      }
+  | Connect_finish of Unix.file_descr (* A [Connect] in progress. *)
+  | Accept of
+      { fd : Unix.file_descr
+      ; peer : Sock.peer
+      }
+  | Send_msg of
+      { fd : Unix.file_descr
+      ; bufs : Cstruct.t list
+      ; fds : Unix.file_descr array
+      ; dst : Sock.addr
+      }
+  | Recv_msg of
+      { fd : Unix.file_descr
+      ; msg : Sock.msghdr
+      }
+
+(* Which of a descriptor's queues an operation waits in. *)
+type dir =
+  [ `Read
+  | `Write
+  | `Poll
+  ]
 
 type 'a job =
   { op : 'a op
@@ -44,7 +71,7 @@ and 'a op =
 
 and 'a state =
   | Queued
-  | Parked
+  | Parked of Unix.file_descr * dir
   | Sleeping of 'a job Timer_heap.entry
   | Completed (* In [cq], not yet collected. *)
   | Collected
@@ -249,35 +276,59 @@ module Stat = struct
 end
 
 let fstatat _ ?fd:_ ~follow:_ _ _ _ = todo "fstatat"
-let socket ?cloexec:_ _ _ _ _ _ = todo "socket"
-let bind _ _ _ _ = todo "bind"
-let listen _ _ _ _ = todo "listen"
-let connect _ _ _ _ = todo "connect"
+let sync t f data = enqueue t (Io (Sync f)) data
+
+let socket ?(cloexec = true) t domain ty protocol data =
+  sync t (fun () -> Sock.socket ~cloexec domain ty protocol) data
+
+let bind t fd addr data =
+  let addr = Sock.encode addr in
+  sync t (fun () -> Sock.bind fd addr) data
+
+let listen t fd backlog data = sync t (fun () -> Sock.listen fd backlog) data
+let shutdown t fd cmd data = sync t (fun () -> Sock.shutdown fd cmd) data
+
+let connect t fd addr data =
+  enqueue t (Io (Connect { fd; addr = Sock.encode addr })) data
 
 module Sockaddr = struct
-  type t = unit
+  type t = Sock.peer
 
-  let create () = todo "Sockaddr.create"
-  let get _ = todo "Sockaddr.get"
+  let create = Sock.peer
+
+  let get t =
+    match Sock.decode t with
+    | Option.Some a -> a
+    | Option.None -> invalid_arg "Uringan.Sockaddr.get: no address stored"
 end
 
-let accept _ _ _ _ = todo "accept"
-let shutdown _ _ _ _ = todo "shutdown"
+let accept t fd peer data = enqueue t (Io (Accept { fd; peer })) data
 
 module Msghdr = struct
-  type t = unit
+  type t = Sock.msghdr
 
-  let create ?n_fds:_ ?addr:_ _ = todo "Msghdr.create"
-  let get_fds _ = todo "Msghdr.get_fds"
+  let create ?(n_fds = 0) ?addr bufs =
+    check_iov "Msghdr.create" bufs;
+    Sock.msghdr ~n_fds addr bufs
+
+  let get_fds = Sock.received_fds
 end
 
-let send_msg ?fds:_ ?dst:_ _ _ _ _ = todo "send_msg"
-let recv_msg _ _ _ _ = todo "recv_msg"
+let send_msg ?(fds = []) ?dst t fd bufs data =
+  check_iov "send_msg" bufs;
+  let dst =
+    match dst with
+    | Option.None -> Sock.no_addr
+    | Option.Some a -> Sock.encode a
+  in
+  enqueue t (Io (Send_msg { fd; bufs; fds = Array.of_list fds; dst })) data
+
+let recv_msg t fd msg data = enqueue t (Io (Recv_msg { fd; msg })) data
 
 let cancel t job data =
   (match job.state with
   | Collected -> invalid_arg "Uringan.cancel: job already collected"
-  | Queued | Parked | Sleeping _ | Completed -> ());
+  | Queued | Parked _ | Sleeping _ | Completed -> ());
   enqueue t (Cancel job) data
 
 (* [perform io] runs the syscall for [io]: a non-negative result or a negative
@@ -289,13 +340,35 @@ let perform = function
   | Readv { fd; file_offset; bufs } -> Io.readv fd ~file_offset bufs
   | Writev { fd; file_offset; bufs } -> Io.writev fd ~file_offset bufs
   | Poll { fd; mask } -> Io.poll fd mask
+  | Sync f -> f ()
+  | Connect { fd; addr } -> Sock.connect fd addr
+  | Connect_finish fd -> Sock.connect_finish fd
+  | Accept { fd; peer } -> Sock.accept fd peer
+  | Send_msg { fd; bufs; fds; dst } -> Sock.send_msg fd bufs fds dst
+  | Recv_msg { fd; msg } -> Sock.recv_msg fd msg
 
-(* The descriptor an operation blocks on, and which queue it waits in. *)
+(* The descriptor an operation blocks on, and which queue it waits in. [Connect]
+   has none: it starts the connection and parks as [Connect_finish]. *)
 let wait_target = function
-  | Noop -> None
-  | Read { fd; _ } | Readv { fd; _ } -> Some (fd, `Read)
-  | Write { fd; _ } | Writev { fd; _ } -> Some (fd, `Write)
+  | Noop | Sync _ | Connect _ -> None
+  | Read { fd; _ } | Readv { fd; _ } | Accept { fd; _ } | Recv_msg { fd; _ } ->
+    Some (fd, `Read)
+  | Write { fd; _ } | Writev { fd; _ } | Connect_finish fd | Send_msg { fd; _ }
+    ->
+    Some (fd, `Write)
   | Poll { fd; _ } -> Some (fd, `Poll)
+
+(* Where to park [io] after it returned [n], if it would block. *)
+let blocked io n =
+  if n = -Io.eagain
+  then Option.map (fun (fd, dir) -> fd, dir, io) (wait_target io)
+  else
+    match io with
+    | Connect { fd; _ } when n = -Sock.einprogress ->
+      Some (fd, `Write, Connect_finish fd)
+    | Noop | Sync _ | Read _ | Write _ | Readv _ | Writev _ | Poll _ | Connect _
+    | Connect_finish _ | Accept _ | Send_msg _ | Recv_msg _ ->
+      None
 
 let complete t job res =
   job.state <- Completed;
@@ -321,7 +394,9 @@ let interest w =
       acc
       + (if Poll_mask.mem Poll_mask.pollin mask then pollin else empty)
       + if Poll_mask.mem Poll_mask.pollout mask then pollout else empty
-    | Noop | Read _ | Write _ | Readv _ | Writev _ -> acc
+    | Noop | Sync _ | Read _ | Write _ | Readv _ | Writev _ | Connect _
+    | Connect_finish _ | Accept _ | Send_msg _ | Recv_msg _ ->
+      acc
   in
   if is_idle w
   then empty
@@ -372,7 +447,7 @@ let park t fd dir job io =
       Hashtbl.replace t.parked fd w;
       w
   in
-  job.state <- Parked;
+  job.state <- Parked (fd, dir);
   Queue.push { job; io } (queue_of w dir);
   rearm t fd w
 
@@ -386,11 +461,11 @@ let attempt_io t job io =
   | Some (fd, ((`Read | `Write) as dir)) when has_waiters t fd dir ->
     (* Don't overtake operations already waiting in this direction. *)
     park t fd dir job io
-  | target ->
+  | _ ->
     let n = perform io in
-    (match target with
-    | Some (fd, dir) when n = -Io.eagain -> park t fd dir job io
-    | _ -> complete t job (Res.of_syscall n))
+    (match blocked io n with
+    | Some (fd, dir, io) -> park t fd dir job io
+    | None -> complete t job (Res.of_syscall n))
 
 let remove_parked q job =
   for _ = 1 to Queue.length q do
@@ -398,18 +473,12 @@ let remove_parked q job =
     if p.job != job then Queue.push p q
   done
 
-let unpark t job =
-  match job.op with
-  | Io io ->
-    Option.iter
-      (fun (fd, dir) ->
-         Option.iter
-           (fun w ->
-              remove_parked (queue_of w dir) job;
-              rearm t fd w)
-           (Hashtbl.find_opt t.parked fd))
-      (wait_target io)
-  | Timeout _ | Cancel _ -> ()
+let unpark t job fd dir =
+  Option.iter
+    (fun w ->
+       remove_parked (queue_of w dir) job;
+       rearm t fd w)
+    (Hashtbl.find_opt t.parked fd)
 
 let cancel_job t job target =
   let cancelled () =
@@ -417,8 +486,8 @@ let cancel_job t job target =
     complete t job (Ok 0)
   in
   match target.state with
-  | Parked ->
-    unpark t target;
+  | Parked (fd, dir) ->
+    unpark t target fd dir;
     cancelled ()
   | Sleeping e ->
     Timer_heap.remove t.timers e;
