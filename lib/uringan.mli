@@ -199,11 +199,13 @@ val openat :
   -> 'a
   -> 'a job option
 (** [openat t ?dir_fd flags perm path d] opens [path]. The result is the new
-    descriptor (see {!Res.fd_result}). *)
+    descriptor (see {!Res.fd_result}). As with [Unix.openfile], the descriptor
+    is close-on-exec if [flags] contains [O_CLOEXEC], or if it does not contain
+    [O_KEEPEXEC] and [Unix]'s close-on-exec default is set. *)
 
 val close : 'a t -> Unix.file_descr -> 'a -> 'a job option
 (** [close t fd d] closes [fd]. Operations still parked on [fd] are completed
-    with [ECANCELED] first. *)
+    with [Error ecanceled] first, in the order they were submitted. *)
 
 val fsync : 'a t -> Unix.file_descr -> 'a -> 'a job option
 
