@@ -3,7 +3,13 @@
  (public_name uringan)
  (foreign_stubs
   (language c)
-  (names epoll_stubs eventfd_stubs io_stubs socket_stubs clock_stubs)
+  (names
+   epoll_stubs
+   eventfd_stubs
+   io_stubs
+   socket_stubs
+   file_stubs
+   clock_stubs)
   (extra_deps uringan_stubs.h)
   (flags :standard -Wall -Wextra -Werror))
  (libraries unix cstruct optint))

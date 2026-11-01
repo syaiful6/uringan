@@ -854,6 +854,203 @@ let test_accept_in_order () =
            (Uringan.Sockaddr.get (List.nth peers i) = Unix.getsockname c))
     clients
 
+let int_of (r : Uringan.Res.t) = Uringan.Res.int_result r
+
+let ok_int msg expected r =
+  check (result int unix_error) msg (Ok expected) (int_of r)
+
+let rec rm_rf path =
+  match (Unix.lstat path).Unix.st_kind with
+  | Unix.S_DIR ->
+    Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+    Unix.rmdir path
+  | Unix.S_REG | Unix.S_LNK | Unix.S_CHR | Unix.S_BLK | Unix.S_FIFO
+  | Unix.S_SOCK ->
+    Unix.unlink path
+  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+
+let with_temp_dir f =
+  let dir = Filename.temp_dir "uringan" "" in
+  Fun.protect ~finally:(fun () -> rm_rf dir) (fun () -> f dir)
+
+let kind =
+  testable
+    (Fmt.of_to_string (function
+       | `Regular_file -> "regular file"
+       | `Directory -> "directory"
+       | `Symbolic_link -> "symlink"
+       | `Character_special -> "character device"
+       | `Block_device -> "block device"
+       | `Fifo -> "fifo"
+       | `Socket -> "socket"
+       | `Unknown -> "unknown"))
+    ( = )
+
+let test_file_lifecycle () =
+  with_ring @@ fun t ->
+  with_temp_dir @@ fun dir ->
+  let path = Filename.concat dir "f" in
+  let fd =
+    Uringan.Res.fd_exn
+      (run t (fun t ->
+         Uringan.openat t [ Unix.O_RDWR; Unix.O_CREAT; Unix.O_EXCL ] 0o640 path))
+      "openat"
+      path
+  in
+  queue (Uringan.write t ~file_offset:(at 0) fd (Cstruct.of_string "hello") 1);
+  check_result "write" 1 (Ok 5) (next t);
+  ok_int "fsync" 0 (run t (fun t -> Uringan.fsync t fd));
+  ok_int "fdatasync" 0 (run t (fun t -> Uringan.fdatasync t fd));
+  let st = Uringan.Stat.create () in
+  ok_int "fstatat" 0 (run t (fun t -> Uringan.fstatat t ~follow:true path st));
+  check kind "kind" `Regular_file (Uringan.Stat.kind st);
+  check int "perm" 0o640 (Uringan.Stat.perm st);
+  check int64 "size" 5L (Uringan.Stat.size st);
+  check int64 "nlink" 1L (Uringan.Stat.nlink st);
+  let u = Unix.LargeFile.stat path in
+  check int64 "ino" (Int64.of_int u.Unix.LargeFile.st_ino) (Uringan.Stat.ino st);
+  check
+    int64
+    "mtime"
+    (Int64.of_float u.Unix.LargeFile.st_mtime)
+    (Uringan.Stat.mtime_sec st);
+  check
+    bool
+    "mtime nsec in range"
+    true
+    (let n = Uringan.Stat.mtime_nsec st in
+     n >= 0 && n < 1_000_000_000);
+  ok_int "ftruncate" 0 (run t (fun t -> Uringan.ftruncate t fd ~len:2L));
+  ok_int
+    "fstat on fd"
+    0
+    (run t (fun t -> Uringan.fstatat t ~fd ~follow:true "" st));
+  check int64 "truncated" 2L (Uringan.Stat.size st);
+  ok_int "close" 0 (run t (fun t -> Uringan.close t fd));
+  check_result
+    "closed"
+    0
+    (Error Unix.EBADF)
+    (0, int_of (run t (fun t -> Uringan.close t fd)));
+  check_result
+    "exclusive"
+    0
+    (Error Unix.EEXIST)
+    ( 0
+    , int_of
+        (run t (fun t ->
+           Uringan.openat
+             t
+             [ Unix.O_RDWR; Unix.O_CREAT; Unix.O_EXCL ]
+             0o640
+             path)) )
+
+let test_open_missing () =
+  with_ring @@ fun t ->
+  with_temp_dir @@ fun dir ->
+  check
+    (result int unix_error)
+    "missing"
+    (Error Unix.ENOENT)
+    (int_of
+       (run t (fun t ->
+          Uringan.openat t [ Unix.O_RDONLY ] 0 (Filename.concat dir "nope"))))
+
+let test_dir_ops () =
+  with_ring @@ fun t ->
+  with_temp_dir @@ fun dir ->
+  let d = Unix.openfile dir [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
+  closing [ d ] @@ fun () ->
+  let st = Uringan.Stat.create () in
+  let stat ~follow path =
+    ok_int
+      ("stat " ^ path)
+      0
+      (run t (fun t -> Uringan.fstatat t ~fd:d ~follow path st));
+    Uringan.Stat.kind st
+  in
+  ok_int
+    "mkdirat"
+    0
+    (run t (fun t -> Uringan.mkdirat t ~mode:0o700 ~fd:d "sub"));
+  check kind "sub" `Directory (stat ~follow:true "sub");
+  check int "mode" 0o700 (Uringan.Stat.perm st);
+  ok_int
+    "symlinkat"
+    0
+    (run t (fun t ->
+       Uringan.symlinkat t ~target:"sub" ~dir_fd:d ~link_path:"link"));
+  check kind "link itself" `Symbolic_link (stat ~follow:false "link");
+  check kind "link target" `Directory (stat ~follow:true "link");
+  Unix.close
+    (Unix.openfile
+       (Filename.concat dir "sub/a")
+       [ Unix.O_CREAT; Unix.O_WRONLY ]
+       0o600);
+  ok_int
+    "linkat"
+    0
+    (run t (fun t ->
+       Uringan.linkat
+         t
+         ~follow:false
+         ~old_dir_fd:d
+         ~old_path:"sub/a"
+         ~new_dir_fd:d
+         ~new_path:"b"));
+  check
+    int64
+    "two links"
+    2L
+    (ignore (stat ~follow:true "b");
+     Uringan.Stat.nlink st);
+  ok_int
+    "renameat"
+    0
+    (run t (fun t -> Uringan.renameat t ~old_dir_fd:d "b" ~new_dir_fd:d "c"));
+  check
+    (result int unix_error)
+    "old name gone"
+    (Error Unix.ENOENT)
+    (int_of (run t (fun t -> Uringan.fstatat t ~fd:d ~follow:true "b" st)));
+  check
+    (result int unix_error)
+    "not empty"
+    (Error Unix.ENOTEMPTY)
+    (int_of (run t (fun t -> Uringan.unlink t ~dir:true ~fd:d "sub")));
+  ok_int
+    "unlink file"
+    0
+    (run t (fun t -> Uringan.unlink t ~dir:false ~fd:d "sub/a"));
+  ok_int
+    "unlink dir"
+    0
+    (run t (fun t -> Uringan.unlink t ~dir:true ~fd:d "sub"));
+  check
+    (result int unix_error)
+    "dir gone"
+    (Error Unix.ENOENT)
+    (int_of (run t (fun t -> Uringan.fstatat t ~fd:d ~follow:true "sub" st)))
+
+let test_close_cancels_parked () =
+  with_ring @@ fun t ->
+  let r, w = pipe () in
+  closing [ w ] @@ fun () ->
+  queue (Uringan.read t ~file_offset:current r (Cstruct.create 4) 1);
+  queue (Uringan.poll_add t r Uringan.Poll_mask.pollin 2);
+  expect_none t;
+  queue (Uringan.close t r 3);
+  check_result "read" 1 (Error Uringan.ecanceled) (next t);
+  check_result "poll" 2 (Error Uringan.ecanceled) (next t);
+  check_result "close" 3 (Ok 0) (next t);
+  check int "idle" 0 (Uringan.active_ops t);
+  (* A new descriptor that reuses the number gets no stale events. *)
+  let r', w' = pipe () in
+  closing [ r'; w' ] @@ fun () ->
+  ignore (Unix.write_substring w' "x" 0 1);
+  queue (Uringan.read t ~file_offset:current r' (Cstruct.create 4) 4);
+  check_result "fresh read" 4 (Ok 1) (next t)
+
 let suite =
   [ "poll mask", `Quick, test_poll_mask
   ; "now is monotonic", `Quick, test_now_monotonic
@@ -907,6 +1104,13 @@ let ring_suite =
   ; "exit with timer", `Quick, test_exit_with_timer
   ]
 
+let file_suite =
+  [ "lifecycle", `Quick, test_file_lifecycle
+  ; "open missing", `Quick, test_open_missing
+  ; "directory ops", `Quick, test_dir_ops
+  ; "close cancels parked", `Quick, test_close_cancels_parked
+  ]
+
 let socket_suite =
   [ "non-blocking", `Quick, test_socket_nonblocking
   ; "tcp", `Quick, test_tcp
@@ -930,6 +1134,7 @@ let () =
     [ "Uringan", suite
     ; "Ring", ring_suite
     ; "Socket", socket_suite
+    ; "File", file_suite
     ; "Epoll", epoll_suite
     ; "Eventfd", eventfd_suite
     ; "Timer_heap", heap_suite

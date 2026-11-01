@@ -1,5 +1,3 @@
-let todo name = failwith ("Uringan." ^ name ^ ": not implemented")
-
 (* A syscall that can be retried until it no longer returns [EAGAIN]. *)
 type io =
   | Noop
@@ -68,6 +66,7 @@ and 'a op =
       ; absolute : bool
       }
   | Cancel of 'a job
+  | Close of Unix.file_descr
 
 and 'a state =
   | Queued
@@ -227,22 +226,36 @@ let writev t ~file_offset fd bufs data =
   check_iov "writev" bufs;
   enqueue t (Io (Writev { fd; file_offset; bufs })) data
 
-let openat _ ?dir_fd:_ _ _ _ _ = todo "openat"
-let close _ _ _ = todo "close"
-let fsync _ _ _ = todo "fsync"
-let fdatasync _ _ _ = todo "fdatasync"
-let ftruncate _ _ ~len:_ _ = todo "ftruncate"
-let unlink _ ~dir:_ ?fd:_ _ _ = todo "unlink"
-let mkdirat _ ~mode:_ ?fd:_ _ _ = todo "mkdirat"
-let renameat _ ?old_dir_fd:_ _ ?new_dir_fd:_ _ _ = todo "renameat"
+let sync t f data = enqueue t (Io (Sync f)) data
 
-let linkat _ ~follow:_ ?old_dir_fd:_ ~old_path:_ ?new_dir_fd:_ ~new_path:_ _ =
-  todo "linkat"
+let openat t ?dir_fd flags perm path data =
+  sync t (fun () -> Fs.openat dir_fd path flags perm) data
 
-let symlinkat _ ~target:_ ?dir_fd:_ ~link_path:_ _ = todo "symlinkat"
+let close t fd data = enqueue t (Close fd) data
+let fsync t fd data = sync t (fun () -> Fs.fsync fd ~data_only:false) data
+let fdatasync t fd data = sync t (fun () -> Fs.fsync fd ~data_only:true) data
+let ftruncate t fd ~len data = sync t (fun () -> Fs.ftruncate fd len) data
+
+let unlink t ~dir ?fd path data =
+  sync t (fun () -> Fs.unlinkat fd path ~dir) data
+
+let mkdirat t ~mode ?fd path data =
+  sync t (fun () -> Fs.mkdirat fd path mode) data
+
+let renameat t ?old_dir_fd old_path ?new_dir_fd new_path data =
+  sync t (fun () -> Fs.renameat old_dir_fd old_path new_dir_fd new_path) data
+
+let linkat t ~follow ?old_dir_fd ~old_path ?new_dir_fd ~new_path data =
+  sync
+    t
+    (fun () -> Fs.linkat old_dir_fd old_path new_dir_fd new_path ~follow)
+    data
+
+let symlinkat t ~target ?dir_fd ~link_path data =
+  sync t (fun () -> Fs.symlinkat target dir_fd link_path) data
 
 module Stat = struct
-  type t = unit
+  include Fs.Stat
 
   type kind =
     [ `Regular_file
@@ -255,28 +268,22 @@ module Stat = struct
     | `Unknown
     ]
 
-  let create () = todo "Stat.create"
-  let kind _ = todo "Stat.kind"
-  let perm _ = todo "Stat.perm"
-  let size _ = todo "Stat.size"
-  let ino _ = todo "Stat.ino"
-  let dev _ = todo "Stat.dev"
-  let rdev _ = todo "Stat.rdev"
-  let nlink _ = todo "Stat.nlink"
-  let uid _ = todo "Stat.uid"
-  let gid _ = todo "Stat.gid"
-  let blksize _ = todo "Stat.blksize"
-  let blocks _ = todo "Stat.blocks"
-  let atime_sec _ = todo "Stat.atime_sec"
-  let atime_nsec _ = todo "Stat.atime_nsec"
-  let mtime_sec _ = todo "Stat.mtime_sec"
-  let mtime_nsec _ = todo "Stat.mtime_nsec"
-  let ctime_sec _ = todo "Stat.ctime_sec"
-  let ctime_nsec _ = todo "Stat.ctime_nsec"
+  let kinds =
+    [| `Regular_file
+     ; `Directory
+     ; `Symbolic_link
+     ; `Character_special
+     ; `Block_device
+     ; `Fifo
+     ; `Socket
+     ; `Unknown
+    |]
+
+  let kind t : kind = kinds.(kind t)
 end
 
-let fstatat _ ?fd:_ ~follow:_ _ _ _ = todo "fstatat"
-let sync t f data = enqueue t (Io (Sync f)) data
+let fstatat t ?fd ~follow path stat data =
+  sync t (fun () -> Fs.fstatat fd path ~follow stat) data
 
 let socket ?(cloexec = true) t domain ty protocol data =
   sync t (fun () -> Sock.socket ~cloexec domain ty protocol) data
@@ -498,6 +505,17 @@ let cancel_job t job target =
        it. *)
     assert false
 
+(* Cancel what is parked on [fd] and drop its epoll registration before closing
+   it. Otherwise the registration, which may outlive this descriptor if it was
+   duplicated, could report events for a reused descriptor number. It is deleted
+   even when nothing is parked, since registrations outlive [parked] entries. *)
+let close_fd t fd =
+  Option.iter
+    (fun w -> fail_all t fd w ecanceled)
+    (Hashtbl.find_opt t.parked fd);
+  (try Epoll.delete t.epoll fd with Unix.Unix_error _ -> ());
+  Fs.close fd
+
 let attempt t job =
   match job.op with
   | Io io -> attempt_io t job io
@@ -505,6 +523,7 @@ let attempt t job =
     let deadline = if absolute then ns else Int64.add (now ()) ns in
     job.state <- Sleeping (Timer_heap.add t.timers deadline job)
   | Cancel target -> cancel_job t job target
+  | Close fd -> complete t job (Res.of_syscall (close_fd t fd))
 
 let fire_timers t =
   if Timer_heap.length t.timers > 0
