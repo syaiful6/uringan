@@ -883,6 +883,85 @@ let test_accept_in_order () =
            (Uringan.Sockaddr.get (List.nth peers i) = Unix.getsockname c))
     clients
 
+(* The client's connect completes from the listen backlog, before any accept is
+   queued; the accept that follows then finds the connection without parking. *)
+let test_connect_before_accept () =
+  with_ring @@ fun t ->
+  with_listener t @@ fun l addr ->
+  let c = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
+  closing [ c ] @@ fun () ->
+  queue (Uringan.connect t c addr 1);
+  check_result "connect" 1 (Ok 0) (next t);
+  check bool "connected" true (Unix.getpeername c = addr);
+  let peer = Uringan.Sockaddr.create () in
+  queue (Uringan.accept t l peer 2);
+  match Uringan.wait ~timeout:1.0 t with
+  | Uringan.None -> fail "no completion"
+  | Uringan.Some { result; data } ->
+    check int "accept: data" 2 data;
+    let s = Uringan.Res.fd_exn result "accept" "" in
+    closing [ s ] @@ fun () ->
+    check
+      bool
+      "peer is client"
+      true
+      (Uringan.Sockaddr.get peer = Unix.getsockname c)
+
+let test_close_parked_accept () =
+  with_ring @@ fun t ->
+  let l = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
+  ok "bind" t (fun t -> Uringan.bind t l loopback);
+  ok "listen" t (fun t -> Uringan.listen t l 8);
+  queue (Uringan.accept t l (Uringan.Sockaddr.create ()) 1);
+  expect_none t;
+  queue (Uringan.close t l 2);
+  check_result "accept" 1 (Error Uringan.ecanceled) (next t);
+  check_result "close" 2 (Ok 0) (next t)
+
+let test_send_closed_peer () =
+  with_ring @@ fun t ->
+  let a, b = socketpair () in
+  closing [ a ] @@ fun () ->
+  Unix.close b;
+  (* Without the EPIPE handling this would kill the test with SIGPIPE. *)
+  queue (Uringan.send_msg t a [ Cstruct.of_string "lost" ] 1);
+  check_result "send" 1 (Error Unix.EPIPE) (next t)
+
+let test_unix_stream () =
+  with_ring @@ fun t ->
+  let path =
+    Filename.concat
+      (Filename.get_temp_dir_name ())
+      (Printf.sprintf "uringan-%d.sock" (Unix.getpid ()))
+  in
+  (try Unix.unlink path with Unix.Unix_error (Unix.ENOENT, _, _) -> ());
+  let addr = Unix.ADDR_UNIX path in
+  let l = new_socket t Unix.PF_UNIX Unix.SOCK_STREAM in
+  closing [ l ] @@ fun () ->
+  Fun.protect ~finally:(fun () -> Unix.unlink path) @@ fun () ->
+  ok "bind" t (fun t -> Uringan.bind t l addr);
+  ok "listen" t (fun t -> Uringan.listen t l 8);
+  let c = new_socket t Unix.PF_UNIX Unix.SOCK_STREAM in
+  closing [ c ] @@ fun () ->
+  queue (Uringan.accept t l (Uringan.Sockaddr.create ()) 1);
+  queue (Uringan.connect t c addr 2);
+  match collect t 2 with
+  | [ (1, accepted); (2, connected) ] ->
+    check
+      (result int unix_error)
+      "connect"
+      (Ok 0)
+      (Uringan.Res.int_result connected);
+    let s = Uringan.Res.fd_exn accepted "accept" "" in
+    closing [ s ] @@ fun () ->
+    let buf = Cstruct.create 8 in
+    queue (Uringan.write t ~file_offset:current c (Cstruct.of_string "unix") 3);
+    check_result "write" 3 (Ok 4) (next t);
+    queue (Uringan.read t ~file_offset:current s buf 4);
+    check_result "read" 4 (Ok 4) (next t);
+    check string "data" "unix" (Cstruct.to_string (Cstruct.sub buf 0 4))
+  | _ -> fail "unexpected completions"
+
 let int_of (r : Uringan.Res.t) = Uringan.Res.int_result r
 
 let ok_int msg expected r =
@@ -1149,6 +1228,10 @@ let socket_suite =
   ; "pass fd", `Quick, test_pass_fd
   ; "udp", `Quick, test_udp
   ; "accept in order", `Quick, test_accept_in_order
+  ; "connect before accept", `Quick, test_connect_before_accept
+  ; "close parked accept", `Quick, test_close_parked_accept
+  ; "send to closed peer", `Quick, test_send_closed_peer
+  ; "unix stream", `Quick, test_unix_stream
   ]
 
 let heap_suite =
