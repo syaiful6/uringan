@@ -1,7 +1,23 @@
 open Alcotest
-module Epoll = Uringan.Private.Epoll
-module Eventfd = Uringan.Private.Eventfd
+module Poller = Uringan.Private.Poller
+module Waker = Uringan.Private.Waker
 module Timer_heap = Uringan.Private.Timer_heap
+
+(* The handful of places where the two backends differ only by name. *)
+[%%import "config.h"]
+[%%ifdef USE_EPOLL]
+
+let backend : [ `Epoll | `Kqueue ] = `Epoll
+let poller_name = "Epoll"
+let ctl_name = "epoll_ctl"
+
+[%%else]
+
+let backend : [ `Epoll | `Kqueue ] = `Kqueue
+let poller_name = "Kqueue"
+let ctl_name = "kevent"
+
+[%%endif]
 
 let test_poll_mask () =
   let open Uringan.Poll_mask in
@@ -20,69 +36,72 @@ let with_pipe f =
   let r, w = Unix.pipe ~cloexec:true () in
   Unix.set_nonblock r;
   Unix.set_nonblock w;
-  let ep = Epoll.create () in
+  let ep = Poller.create () in
   Fun.protect
     ~finally:(fun () -> List.iter Unix.close [ r; w; (ep :> Unix.file_descr) ])
     (fun () -> f ep r w)
 
-let test_epoll_readable () =
+let test_poller_readable () =
   with_pipe @@ fun ep r w ->
-  let events = Epoll.Events.create 8 in
-  Epoll.add ep r Epoll.Flags.pollin;
-  check int "nothing ready" 0 (Epoll.wait ep events ~timeout_ms:0);
+  let events = Poller.Events.create 8 in
+  Poller.add ep r Poller.Flags.pollin;
+  check int "nothing ready" 0 (Poller.wait ep events ~timeout_ms:0);
   ignore (Unix.write_substring w "x" 0 1);
-  check int "one ready" 1 (Epoll.wait ep events ~timeout_ms:1000);
-  check bool "ready fd is read end" true (Epoll.Events.fd events 0 = r);
+  check int "one ready" 1 (Poller.wait ep events ~timeout_ms:1000);
+  check bool "ready fd is read end" true (Poller.Events.fd events 0 = r);
   check
     bool
     "pollin set"
     true
-    (Epoll.Flags.mem Epoll.Flags.pollin (Epoll.Events.flags events 0))
+    (Poller.Flags.mem Poller.Flags.pollin (Poller.Events.flags events 0))
 
-let test_epoll_oneshot () =
+let test_poller_oneshot () =
   with_pipe @@ fun ep r w ->
-  let events = Epoll.Events.create 8 in
-  let flags = Epoll.Flags.(pollin + oneshot) in
-  Epoll.add ep r flags;
+  let events = Poller.Events.create 8 in
+  let flags = Poller.Flags.(pollin + oneshot) in
+  Poller.add ep r flags;
   ignore (Unix.write_substring w "x" 0 1);
-  check int "fires once" 1 (Epoll.wait ep events ~timeout_ms:1000);
-  check int "disarmed" 0 (Epoll.wait ep events ~timeout_ms:0);
-  Epoll.modify ep r flags;
-  check int "re-armed" 1 (Epoll.wait ep events ~timeout_ms:0)
+  check int "fires once" 1 (Poller.wait ep events ~timeout_ms:1000);
+  check int "disarmed" 0 (Poller.wait ep events ~timeout_ms:0);
+  Poller.modify ep r flags;
+  check int "re-armed" 1 (Poller.wait ep events ~timeout_ms:0)
 
-let test_epoll_delete () =
+let test_poller_delete () =
   with_pipe @@ fun ep r w ->
-  let events = Epoll.Events.create 8 in
-  Epoll.add ep r Epoll.Flags.pollin;
-  Epoll.delete ep r;
+  let events = Poller.Events.create 8 in
+  Poller.add ep r Poller.Flags.pollin;
+  Poller.delete ep r;
   ignore (Unix.write_substring w "x" 0 1);
-  check int "not watched" 0 (Epoll.wait ep events ~timeout_ms:0);
+  check int "not watched" 0 (Poller.wait ep events ~timeout_ms:0);
   check_raises
     "delete again"
-    (Unix.Unix_error (Unix.ENOENT, "epoll_ctl", ""))
-    (fun () -> Epoll.delete ep r)
+    (Unix.Unix_error (Unix.ENOENT, ctl_name, ""))
+    (fun () -> Poller.delete ep r)
 
-let test_epoll_hup () =
+let test_poller_hup () =
   let r, w = Unix.pipe ~cloexec:true () in
-  let ep = Epoll.create () in
-  let events = Epoll.Events.create 8 in
-  Epoll.add ep r Epoll.Flags.pollin;
+  let ep = Poller.create () in
+  let events = Poller.Events.create 8 in
+  Poller.add ep r Poller.Flags.pollin;
   Unix.close w;
-  check int "one ready" 1 (Epoll.wait ep events ~timeout_ms:1000);
+  check int "one ready" 1 (Poller.wait ep events ~timeout_ms:1000);
+  let flags = Poller.Events.flags events 0 in
   check
     bool
-    "pollhup set"
+    "hang-up reported"
     true
-    (Epoll.Flags.mem Epoll.Flags.pollhup (Epoll.Events.flags events 0));
+    (Poller.Flags.mem Poller.Flags.pollhup flags
+    || Poller.Flags.mem Poller.Flags.pollrdhup flags);
+  check int "read reports eof" 0 (Unix.read r (Bytes.create 1) 0 1);
   Unix.close r;
-  Epoll.close ep
+  Poller.close ep
 
-let test_epoll_timeout () =
-  let ep = Epoll.create () in
-  let events = Epoll.Events.create 1 in
+let test_poller_timeout () =
+  let ep = Poller.create () in
+  let events = Poller.Events.create 1 in
   let start = Uringan.now () in
-  check int "times out" 0 (Epoll.wait ep events ~timeout_ms:20);
-  Epoll.close ep;
+  check int "times out" 0 (Poller.wait ep events ~timeout_ms:20);
+  Poller.close ep;
   check
     bool
     "waited ~20ms"
@@ -90,19 +109,21 @@ let test_epoll_timeout () =
     (Int64.sub (Uringan.now ()) start >= 19_000_000L)
 
 let test_events_bounds () =
-  let events = Epoll.Events.create 2 in
-  check int "length" 2 (Epoll.Events.length events);
-  check_raises "out of bounds" (Invalid_argument "Epoll.Events.fd") (fun () ->
-    ignore (Epoll.Events.fd events 2));
+  let events = Poller.Events.create 2 in
+  check int "length" 2 (Poller.Events.length events);
+  check_raises
+    "out of bounds"
+    (Invalid_argument (poller_name ^ ".Events.fd"))
+    (fun () -> ignore (Poller.Events.fd events 2));
   check_raises
     "non-positive size"
-    (Invalid_argument "Epoll.Events.create")
-    (fun () -> ignore (Epoll.Events.create 0))
+    (Invalid_argument (poller_name ^ ".Events.create"))
+    (fun () -> ignore (Poller.Events.create 0))
 
 let test_ring_lifecycle () =
   let t = Uringan.create ~queue_depth:16 () in
   check int "queue_depth" 16 (Uringan.queue_depth t);
-  check bool "backend" true (Uringan.backend t = `Epoll);
+  check bool "backend" true (Uringan.backend t = backend);
   Uringan.exit t;
   Uringan.exit t;
   check_raises
@@ -110,49 +131,49 @@ let test_ring_lifecycle () =
     (Invalid_argument "Uringan.create: queue_depth <= 0")
     (fun () -> ignore (Uringan.create ~queue_depth:0 ()))
 
-let with_eventfd f =
-  let efd = Eventfd.create () in
-  Fun.protect ~finally:(fun () -> Eventfd.close efd) (fun () -> f efd)
+let with_waker f =
+  let w = Waker.create () in
+  Fun.protect ~finally:(fun () -> Waker.close w) (fun () -> f w)
 
-let test_eventfd_drain () =
-  with_eventfd @@ fun efd ->
-  check bool "not signalled" false (Eventfd.drain efd);
-  Eventfd.signal efd;
-  Eventfd.signal efd;
-  check bool "signalled" true (Eventfd.drain efd);
-  check bool "signals collapsed" false (Eventfd.drain efd)
+let test_waker_drain () =
+  with_waker @@ fun efd ->
+  check bool "not signalled" false (Waker.drain efd);
+  Waker.signal efd;
+  Waker.signal efd;
+  check bool "signalled" true (Waker.drain efd);
+  check bool "signals collapsed" false (Waker.drain efd)
 
-let test_eventfd_wakes_epoll () =
-  with_eventfd @@ fun efd ->
-  let ep = Epoll.create () in
-  let events = Epoll.Events.create 1 in
-  Epoll.add ep (efd :> Unix.file_descr) Epoll.Flags.pollin;
-  check int "idle" 0 (Epoll.wait ep events ~timeout_ms:0);
-  Eventfd.signal efd;
-  check int "woken" 1 (Epoll.wait ep events ~timeout_ms:0);
-  check int "stays readable" 1 (Epoll.wait ep events ~timeout_ms:0);
-  ignore (Eventfd.drain efd);
-  check int "idle after drain" 0 (Epoll.wait ep events ~timeout_ms:0);
-  Epoll.close ep
+let test_waker_wakes_poller () =
+  with_waker @@ fun efd ->
+  let ep = Poller.create () in
+  let events = Poller.Events.create 1 in
+  Poller.add ep (Waker.fd efd) Poller.Flags.pollin;
+  check int "idle" 0 (Poller.wait ep events ~timeout_ms:0);
+  Waker.signal efd;
+  check int "woken" 1 (Poller.wait ep events ~timeout_ms:0);
+  check int "stays readable" 1 (Poller.wait ep events ~timeout_ms:0);
+  ignore (Waker.drain efd);
+  check int "idle after drain" 0 (Poller.wait ep events ~timeout_ms:0);
+  Poller.close ep
 
-let test_eventfd_cross_domain () =
-  with_eventfd @@ fun efd ->
-  let ep = Epoll.create () in
-  Epoll.add ep (efd :> Unix.file_descr) Epoll.Flags.pollin;
+let test_waker_cross_domain () =
+  with_waker @@ fun efd ->
+  let ep = Poller.create () in
+  Poller.add ep (Waker.fd efd) Poller.Flags.pollin;
   let waiter =
     Domain.spawn (fun () ->
-      Epoll.wait ep (Epoll.Events.create 1) ~timeout_ms:5000)
+      Poller.wait ep (Poller.Events.create 1) ~timeout_ms:5000)
   in
   Unix.sleepf 0.02;
   let start = Uringan.now () in
-  Eventfd.signal efd;
+  Waker.signal efd;
   check int "woken from other domain" 1 (Domain.join waiter);
   check
     bool
     "woke promptly"
     true
     (Int64.sub (Uringan.now ()) start < 1_000_000_000L);
-  Epoll.close ep
+  Poller.close ep
 
 let unix_error = testable (Fmt.of_to_string Unix.error_message) ( = )
 
@@ -724,14 +745,22 @@ let test_tcp () =
     check_result "eof after shutdown" 5 (Ok 0) (next t)
   | _ -> fail "unexpected completions"
 
+(* A port that was ours and is now free, so connecting to it is refused. A
+   socket that is bound but not listening is not enough: Linux answers its SYN
+   with an RST, macOS drops it and the connect stays in progress. *)
+let closed_port () =
+  let l = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.bind l loopback;
+  let addr = Unix.getsockname l in
+  Unix.close l;
+  addr
+
 let test_connect_refused () =
   with_ring @@ fun t ->
-  (* Bound but not listening, so the port is ours and refuses connections. *)
-  let l = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
+  let addr = closed_port () in
   let c = new_socket t Unix.PF_INET Unix.SOCK_STREAM in
-  closing [ l; c ] @@ fun () ->
-  ok "bind" t (fun t -> Uringan.bind t l loopback);
-  queue (Uringan.connect t c (Unix.getsockname l) 1);
+  closing [ c ] @@ fun () ->
+  queue (Uringan.connect t c addr 1);
   check_result "refused" 1 (Error Unix.ECONNREFUSED) (next t)
 
 let test_connect_unix_missing () =
@@ -1057,19 +1086,19 @@ let suite =
   ; "ring lifecycle", `Quick, test_ring_lifecycle
   ]
 
-let epoll_suite =
-  [ "readable", `Quick, test_epoll_readable
-  ; "oneshot", `Quick, test_epoll_oneshot
-  ; "delete", `Quick, test_epoll_delete
-  ; "hup", `Quick, test_epoll_hup
-  ; "timeout", `Quick, test_epoll_timeout
+let poller_suite =
+  [ "readable", `Quick, test_poller_readable
+  ; "oneshot", `Quick, test_poller_oneshot
+  ; "delete", `Quick, test_poller_delete
+  ; "hup", `Quick, test_poller_hup
+  ; "timeout", `Quick, test_poller_timeout
   ; "events bounds", `Quick, test_events_bounds
   ]
 
-let eventfd_suite =
-  [ "drain", `Quick, test_eventfd_drain
-  ; "wakes epoll", `Quick, test_eventfd_wakes_epoll
-  ; "cross domain", `Quick, test_eventfd_cross_domain
+let waker_suite =
+  [ "drain", `Quick, test_waker_drain
+  ; "wakes poller", `Quick, test_waker_wakes_poller
+  ; "cross domain", `Quick, test_waker_cross_domain
   ]
 
 let ring_suite =
@@ -1135,7 +1164,7 @@ let () =
     ; "Ring", ring_suite
     ; "Socket", socket_suite
     ; "File", file_suite
-    ; "Epoll", epoll_suite
-    ; "Eventfd", eventfd_suite
+    ; "Poller", poller_suite
+    ; "Waker", waker_suite
     ; "Timer_heap", heap_suite
     ]

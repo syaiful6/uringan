@@ -1,3 +1,7 @@
+#include "config.h"
+
+#ifdef USE_EPOLL
+
 #include <errno.h>
 #include <stdint.h>
 #include <sys/eventfd.h>
@@ -42,3 +46,5 @@ value uringan_eventfd_drain(value v_fd) {
   }
   return Val_true;
 }
+
+#endif /* USE_EPOLL */

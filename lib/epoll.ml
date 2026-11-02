@@ -1,3 +1,6 @@
+[%%import "config.h"]
+[%%ifdef USE_EPOLL]
+
 type t = Unix.file_descr
 
 module Flags = struct
@@ -62,3 +65,5 @@ let add t fd flags = ctl t 0 fd flags
 let modify t fd flags = ctl t 1 fd flags
 let delete t fd = ctl t 2 fd Flags.empty
 let wait t events ~timeout_ms = wait t events timeout_ms
+
+[%%endif]

@@ -1,4 +1,12 @@
 (tests
  (names uringan_test)
  (package uringan)
- (libraries alcotest fmt cstruct optint unix uringan))
+ (libraries alcotest fmt cstruct optint unix uringan)
+ (preprocess
+  (pps ppx_optcomp))
+ (preprocessor_deps config.h))
+
+; The backend the library was built for, so the tests can name it too.
+
+(rule
+ (copy %{project_root}/lib/config.h config.h))

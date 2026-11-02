@@ -92,6 +92,11 @@ value uringan_readv(value v_fd, value v_bufs, value v_n, value v_file_offset) {
   ssize_t r;
   int err;
 
+  /* An empty list is a no-op: Linux's readv/writev return 0 for it, the BSDs
+     fail with EINVAL. Short-circuiting keeps the result the same everywhere
+     and saves a syscall. */
+  if (n == 0) CAMLreturn(Val_long(0));
+
   uringan_iov_of_cstructs(v_bufs, iov, n);
   caml_enter_blocking_section();
   do
@@ -112,6 +117,11 @@ value uringan_writev(value v_fd, value v_bufs, value v_n,
   struct iovec iov[n > 0 ? n : 1];
   ssize_t r;
   int err;
+
+  /* An empty list is a no-op: Linux's readv/writev return 0 for it, the BSDs
+     fail with EINVAL. Short-circuiting keeps the result the same everywhere
+     and saves a syscall. */
+  if (n == 0) CAMLreturn(Val_long(0));
 
   uringan_iov_of_cstructs(v_bufs, iov, n);
   caml_enter_blocking_section();

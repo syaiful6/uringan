@@ -1,3 +1,7 @@
+#include "config.h"
+
+#ifdef USE_EPOLL
+
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
@@ -99,3 +103,5 @@ value uringan_epoll_flag_err(value v_unit) { (void)v_unit; return Val_int(EPOLLE
 value uringan_epoll_flag_hup(value v_unit) { (void)v_unit; return Val_int(EPOLLHUP); }
 value uringan_epoll_flag_rdhup(value v_unit) { (void)v_unit; return Val_int(EPOLLRDHUP); }
 value uringan_epoll_flag_oneshot(value v_unit) { (void)v_unit; return Val_int(EPOLLONESHOT); }
+
+#endif /* USE_EPOLL */

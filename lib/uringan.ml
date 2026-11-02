@@ -1,3 +1,17 @@
+(* Which poller backs the ring. Both modules present the same interface; the one
+   that was not selected is compiled away to nothing. See lib/config/discover.ml
+   for the detection and config.h for the result. *)
+[%%import "config.h"]
+[%%ifdef USE_EPOLL]
+
+module Poller = Epoll
+
+[%%else]
+
+module Poller = Kqueue
+
+[%%endif]
+
 (* A syscall that can be retried until it no longer returns [EAGAIN]. *)
 type io =
   | Noop
@@ -87,8 +101,9 @@ type 'a waiters =
   { readers : 'a parked Queue.t
   ; writers : 'a parked Queue.t
   ; pollers : 'a parked Queue.t
-  ; mutable armed : Epoll.Flags.t
-    (* The one-shot interest registered with epoll that has not fired yet. *)
+  ; mutable armed : Poller.Flags.t
+    (* The one-shot interest registered with the poller that has not fired
+       yet. *)
   }
 
 module Res = struct
@@ -111,9 +126,9 @@ module Res = struct
 end
 
 type 'a t =
-  { epoll : Epoll.t
-  ; events : Epoll.Events.t
-  ; wakeup : Eventfd.t
+  { poller : Poller.t
+  ; events : Poller.Events.t
+  ; wakeup : Waker.t
   ; queue_depth : int
   ; sq : 'a job Queue.t  (** Queued, not yet attempted. *)
   ; cq : ('a job * Res.t) Queue.t  (** Completed, not yet collected. *)
@@ -125,20 +140,22 @@ type 'a t =
 
 let create ~queue_depth () =
   if queue_depth <= 0 then invalid_arg "Uringan.create: queue_depth <= 0";
-  let epoll = Epoll.create () in
-  match Eventfd.create () with
+  let poller = Poller.create () in
+  match Waker.create () with
   | exception e ->
-    Epoll.close epoll;
+    Poller.close poller;
     raise e
   | wakeup ->
-    (try Epoll.add epoll (wakeup :> Unix.file_descr) Epoll.Flags.pollin with
+    (try Poller.add poller (Waker.fd wakeup) Poller.Flags.pollin with
     | e ->
-      Eventfd.close wakeup;
-      Epoll.close epoll;
+      Waker.close wakeup;
+      Poller.close poller;
       raise e);
-    { epoll
-    ; (* At most one event per parked descriptor, plus the eventfd. *)
-      events = Epoll.Events.create (queue_depth + 1)
+    { poller
+    ; (* At most one event per parked descriptor, plus the waker. kqueue reports
+         a descriptor's two directions separately, so a wait can occasionally
+         fill this and leave the remainder queued for the next one. *)
+      events = Poller.Events.create (queue_depth + 1)
     ; wakeup
     ; queue_depth
     ; sq = Queue.create ()
@@ -160,11 +177,19 @@ let exit t =
       invalid_arg
         (Printf.sprintf "Uringan.exit: %d operation(s) in flight" t.in_flight);
     t.closed <- true;
-    Eventfd.close t.wakeup;
-    Epoll.close t.epoll
+    Waker.close t.wakeup;
+    Poller.close t.poller
   end
 
+[%%ifdef USE_EPOLL]
+
 let backend _ = `Epoll
+
+[%%else]
+
+let backend _ = `Kqueue
+
+[%%endif]
 
 let enqueue t op data =
   check t;
@@ -391,10 +416,10 @@ let is_idle w =
   && Queue.is_empty w.writers
   && Queue.is_empty w.pollers
 
-(* epoll always reports errors and hang-ups; [pollerr] is included only so that
-   an [interest] is empty exactly when [w] is idle. *)
+(* Both backends always report errors and hang-ups; [pollerr] is included only
+   so that an [interest] is empty exactly when [w] is idle. *)
 let interest w =
-  let open Epoll.Flags in
+  let open Poller.Flags in
   let poller p acc =
     match p.io with
     | Poll { mask; _ } ->
@@ -412,15 +437,15 @@ let interest w =
     + (if Queue.is_empty w.readers then empty else pollin)
     + if Queue.is_empty w.writers then empty else pollout
 
-(* Re-arm epoll for whatever [w] is still waiting for. The registration outlives
-   empty [waiters], so try [modify] before [add]. *)
+(* Re-arm the poller for whatever [w] is still waiting for. The registration
+   outlives empty [waiters], so try [modify] before [add]. *)
 let arm t fd w =
   let flags = interest w in
   if flags <> w.armed
   then begin
-    let flags' = Epoll.Flags.(flags + oneshot) in
-    (try Epoll.modify t.epoll fd flags' with
-    | Unix.Unix_error (Unix.ENOENT, _, _) -> Epoll.add t.epoll fd flags');
+    let flags' = Poller.Flags.(flags + oneshot) in
+    (try Poller.modify t.poller fd flags' with
+    | Unix.Unix_error (Unix.ENOENT, _, _) -> Poller.add t.poller fd flags');
     w.armed <- flags
   end
 
@@ -448,7 +473,7 @@ let park t fd dir job io =
         { readers = Queue.create ()
         ; writers = Queue.create ()
         ; pollers = Queue.create ()
-        ; armed = Epoll.Flags.empty
+        ; armed = Poller.Flags.empty
         }
       in
       Hashtbl.replace t.parked fd w;
@@ -505,7 +530,7 @@ let cancel_job t job target =
        it. *)
     assert false
 
-(* Cancel what is parked on [fd] and drop its epoll registration before closing
+(* Cancel what is parked on [fd] and drop its poller registration before closing
    it. Otherwise the registration, which may outlive this descriptor if it was
    duplicated, could report events for a reused descriptor number. It is deleted
    even when nothing is parked, since registrations outlive [parked] entries. *)
@@ -513,7 +538,7 @@ let close_fd t fd =
   Option.iter
     (fun w -> fail_all t fd w ecanceled)
     (Hashtbl.find_opt t.parked fd);
-  (try Epoll.delete t.epoll fd with Unix.Unix_error _ -> ());
+  (try Poller.delete t.poller fd with Unix.Unix_error _ -> ());
   Fs.close fd
 
 let attempt t job =
@@ -566,8 +591,8 @@ let on_ready t fd flags =
   match Hashtbl.find_opt t.parked fd with
   | None -> ()
   | Some w ->
-    w.armed <- Epoll.Flags.empty;
-    let open Epoll.Flags in
+    w.armed <- Poller.Flags.empty;
+    let open Poller.Flags in
     (* On error or hang-up, retrying reports the error or end of file. *)
     let failed = mem pollerr flags || mem pollhup flags in
     (* Pollers first, so they observe the readiness before readers or writers
@@ -580,16 +605,16 @@ let on_ready t fd flags =
 (* Wait up to [timeout_ms] for readiness and retry what became ready. Returns
    [true] if {!wakeup} was called. *)
 let poll t ~timeout_ms =
-  let n = Epoll.wait t.epoll t.events ~timeout_ms in
+  let n = Poller.wait t.poller t.events ~timeout_ms in
   let woken = ref false in
   for i = 0 to n - 1 do
-    let fd = Epoll.Events.fd t.events i in
-    if fd = (t.wakeup :> Unix.file_descr)
+    let fd = Poller.Events.fd t.events i in
+    if fd = Waker.fd t.wakeup
     then begin
-      ignore (Eventfd.drain t.wakeup : bool);
+      ignore (Waker.drain t.wakeup : bool);
       woken := true
     end
-    else on_ready t fd (Epoll.Events.flags t.events i)
+    else on_ready t fd (Poller.Events.flags t.events i)
   done;
   !woken
 
@@ -601,7 +626,8 @@ let submit t =
   done;
   n
 
-(* Epoll takes a C int; longer waits are split up by the [wait] loop. *)
+(* Both backends take their timeout as a C int; longer waits are split up by the
+   [wait] loop. *)
 let max_timeout_ms = 1_000_000_000
 
 let ms_until deadline =
@@ -669,12 +695,12 @@ let get_cqe_nonblocking t =
   end;
   take_completion t
 
-let wakeup t = Eventfd.signal t.wakeup
+let wakeup t = Waker.signal t.wakeup
 let active_ops t = t.in_flight
 let sqe_ready t = Queue.length t.sq
 
 module Private = struct
-  module Epoll = Epoll
-  module Eventfd = Eventfd
+  module Poller = Poller
+  module Waker = Waker
   module Timer_heap = Timer_heap
 end

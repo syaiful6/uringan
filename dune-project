@@ -19,8 +19,10 @@
  (depends
   (ocaml (>= 5.4.1))
   dune
+  dune-configurator
   (cstruct (>= 6.0.0))
   (optint (>= 0.3.0))
+  (ppx_optcomp (>= 0.17.1))
   (alcotest :with-test)
   (fmt :with-test)
   (ocamlformat :with-dev-setup)

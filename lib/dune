@@ -5,11 +5,22 @@
   (language c)
   (names
    epoll_stubs
+   kqueue_stubs
    eventfd_stubs
    io_stubs
    socket_stubs
    file_stubs
    clock_stubs)
-  (extra_deps uringan_stubs.h)
+  (extra_deps uringan_stubs.h config.h)
   (flags :standard -Wall -Wextra -Werror))
- (libraries unix cstruct optint))
+ (libraries unix cstruct optint)
+ (preprocess
+  (pps ppx_optcomp))
+ (preprocessor_deps config.h))
+
+(rule
+ (targets config.h)
+ (deps
+  (:discover config/discover.exe))
+ (action
+  (run %{discover})))
