@@ -172,7 +172,8 @@ val readv :
   -> 'a job option
 (** [readv] is like {!read} but scatters into several buffers.
 
-    Requires [List.length bufs <= iov_max]. *)
+    Requires [List.length bufs <= iov_max].
+    An empty list completes with [0] without a syscall. *)
 
 val writev :
    'a t
@@ -183,7 +184,8 @@ val writev :
   -> 'a job option
 (** [writev] is like {!write} but gathers from several buffers.
 
-    Requires [List.length bufs <= iov_max]. *)
+    Requires [List.length bufs <= iov_max].
+    An empty list completes with [0] without a syscall. *)
 
 (** {3 Files and directories}
 
@@ -434,7 +436,7 @@ val get_cqe_nonblocking : 'a t -> 'a completion_option
 val wakeup : _ t -> unit
 (** [wakeup t] makes a {!wait} in progress (or the next one) return. It is the
     only function safe to call from another thread or domain. Implemented with
-    an eventfd on Linux and [EVFILT_USER] on kqueue. *)
+    an eventfd on Linux and a self-pipe elsewhere. *)
 
 val active_ops : _ t -> int
 (** [active_ops t] is the number of operations in flight: queued, parked, or
@@ -447,7 +449,17 @@ val sqe_ready : _ t -> int
 
 (** Internal modules, exposed for testing only. *)
 module Private : sig
-  module Epoll = Epoll
-  module Eventfd = Eventfd
+  [%%import "config.h"]
+  [%%ifdef USE_EPOLL]
+
+  module Poller = Epoll
+
+  [%%else]
+
+  module Poller = Kqueue
+
+  [%%endif]
+
+  module Waker = Waker
   module Timer_heap = Timer_heap
 end

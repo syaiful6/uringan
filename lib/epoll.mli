@@ -1,4 +1,10 @@
-(** Thin bindings to Linux epoll. Internal to {!Uringan}. *)
+(** Thin bindings to Linux epoll. Internal to {!Uringan}.
+
+    Empty unless the epoll backend was selected; see {!Kqueue} for the other
+    half and {!Uringan.Private.Poller} for the one that is in use. *)
+
+[%%import "config.h"]
+[%%ifdef USE_EPOLL]
 
 type t = private Unix.file_descr
 
@@ -59,3 +65,5 @@ val wait : t -> Events.t -> timeout_ms:int -> int
     at least one event is ready or [timeout_ms] elapses ([-1] waits forever,
     [0] polls). Returns the number of events stored in [events], [0] on timeout
     or if interrupted by a signal. *)
+
+[%%endif]
