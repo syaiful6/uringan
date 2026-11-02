@@ -32,3 +32,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+available: [ os != "win32" ]
