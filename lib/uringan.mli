@@ -6,9 +6,11 @@
     - Operations are queued, then attempted eagerly (non-blocking) by {!submit}.
     - An operation that fails with [EAGAIN] is parked on its file descriptor
       until epoll/kqueue reports readiness, then retried.
-    - Operations on regular files and metadata operations (open, stat, fsync,
-      unlink, ...) run synchronously inside {!submit} and may block the caller,
-      since readiness notification does not apply to them.
+    - Readiness notification does not apply to file system operations (open,
+      stat, fsync, unlink, ...), so {!submit} hands them to a pool of system
+      threads owned by the ring, and they complete when a worker finishes.
+      Reads and writes on regular files still run synchronously inside
+      {!submit}.
     - Timeouts are kept in a user-space timer heap; the earliest deadline bounds
       the time spent blocked in [epoll_wait]/[kevent].
 
@@ -57,22 +59,28 @@ end
 
 (** {2 Lifecycle} *)
 
-val create : queue_depth:int -> unit -> 'a t
-(** [create ~queue_depth ()] creates a ring backed by epoll or kqueue.
+val create : ?fs_threads:int -> queue_depth:int -> unit -> 'a t
+(** [create ?fs_threads ~queue_depth ()] creates a ring backed by epoll or
+    kqueue.
 
-    [queue_depth] caps the number of operations in flight (queued, parked, or
-    completed but not yet collected); operations beyond it are refused, giving
-    backpressure.
+    [queue_depth] caps the number of operations in flight (queued, parked,
+    running on the thread pool, or completed but not yet collected); operations
+    beyond it are refused, giving backpressure.
 
-    @raise Invalid_argument if [queue_depth <= 0]
+    [fs_threads] (default [4]) caps the threads that run file system
+    operations. They are started on demand and stopped by {!exit}. With [0],
+    those operations run synchronously inside {!submit} instead, blocking the
+    caller.
+
+    @raise Invalid_argument if [queue_depth <= 0] or [fs_threads < 0]
     @raise Unix.Unix_error if the backend cannot be created *)
 
 val queue_depth : _ t -> int
 (** [queue_depth t] is the [queue_depth] given to {!create}. *)
 
 val exit : _ t -> unit
-(** [exit t] releases the backend descriptors of [t]. The ring cannot be used
-    afterwards.
+(** [exit t] stops the thread pool and releases the backend descriptors of [t].
+    The ring cannot be used afterwards.
 
     @raise Invalid_argument if any operations are in flight (see
     {!active_ops}) *)
@@ -189,7 +197,11 @@ val writev :
 
 (** {3 Files and directories}
 
-    These run synchronously in {!submit}. Where [?fd]/[?dir_fd] is omitted,
+    Except for {!close}, these run on the ring's thread pool (see {!create}),
+    concurrently with each other and with the rest of the ring, so they may
+    complete in any order: submit an operation only once those it depends on
+    have completed. Buffers passed to them, such as a {!Stat.t}, must not be
+    used until the operation completes. Where [?fd]/[?dir_fd] is omitted,
     relative paths are resolved against the current directory. *)
 
 val openat :
@@ -403,9 +415,11 @@ val ecanceled : Unix.error
 val cancel : 'a t -> 'a job -> 'a -> 'a job option
 (** [cancel t job d] cancels [job] on the next {!submit}. Both operations
     produce a completion: if [job] was still waiting (parked on a descriptor,
-    or a pending {!timeout}) it completes with [Error ecanceled] and the cancel
-    with [0]; if it had already completed, the cancel completes with
-    [Error ENOENT].
+    a pending {!timeout}, or a file system operation not yet started by the
+    thread pool) it completes with [Error ecanceled] and the cancel with [0];
+    if it is already running on the thread pool, which cannot interrupt it, the
+    cancel completes with [Error EALREADY] and [job] completes normally; if it
+    had already completed, the cancel completes with [Error ENOENT].
 
     @raise Invalid_argument
       if [job]'s completion has already been collected *)
@@ -462,4 +476,5 @@ module Private : sig
 
   module Waker = Waker
   module Timer_heap = Timer_heap
+  module Thread_pool = Thread_pool
 end

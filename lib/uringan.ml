@@ -81,11 +81,14 @@ and 'a op =
       }
   | Cancel of 'a job
   | Close of Unix.file_descr
+  | Blocking of (unit -> int)
+(* A file system call, run on the thread pool if there is one. *)
 
 and 'a state =
   | Queued
   | Parked of Unix.file_descr * dir
   | Sleeping of 'a job Timer_heap.entry
+  | Offloaded of ('a job, (int, Unix.error) result) Thread_pool.task
   | Completed (* In [cq], not yet collected. *)
   | Collected
 
@@ -129,6 +132,8 @@ type 'a t =
   { poller : Poller.t
   ; events : Poller.Events.t
   ; wakeup : Waker.t
+  ; pool : ('a job, Res.t) Thread_pool.t option
+    (* Runs [Blocking] ops; [None] runs them inline. *)
   ; queue_depth : int
   ; sq : 'a job Queue.t  (** Queued, not yet attempted. *)
   ; cq : ('a job * Res.t) Queue.t  (** Completed, not yet collected. *)
@@ -138,33 +143,46 @@ type 'a t =
   ; mutable closed : bool
   }
 
-let create ~queue_depth () =
+let create ?(fs_threads = 4) ~queue_depth () =
   if queue_depth <= 0 then invalid_arg "Uringan.create: queue_depth <= 0";
-  let poller = Poller.create () in
-  match Waker.create () with
-  | exception e ->
-    Poller.close poller;
-    raise e
-  | wakeup ->
-    (try Poller.add poller (Waker.fd wakeup) Poller.Flags.pollin with
-    | e ->
-      Waker.close wakeup;
-      Poller.close poller;
-      raise e);
-    { poller
-    ; (* At most one event per parked descriptor, plus the waker. kqueue reports
-         a descriptor's two directions separately, so a wait can occasionally
-         fill this and leave the remainder queued for the next one. *)
-      events = Poller.Events.create (queue_depth + 1)
-    ; wakeup
-    ; queue_depth
-    ; sq = Queue.create ()
-    ; cq = Queue.create ()
-    ; parked = Hashtbl.create 16
-    ; timers = Timer_heap.create ()
-    ; in_flight = 0
-    ; closed = false
-    }
+  if fs_threads < 0 then invalid_arg "Uringan.create: fs_threads < 0";
+  (* Each resource is released if a later step fails. *)
+  let acquire create release k =
+    let r = create () in
+    match k r with
+    | v -> v
+    | exception e ->
+      release r;
+      raise e
+  in
+  acquire Poller.create Poller.close @@ fun poller ->
+  acquire Waker.create Waker.close @@ fun wakeup ->
+  Poller.add poller (Waker.fd wakeup) Poller.Flags.pollin;
+  let create_pool () =
+    if fs_threads = 0
+    then Option.None
+    else Option.Some (Thread_pool.create ~max_threads:fs_threads)
+  in
+  acquire create_pool (Option.iter Thread_pool.shutdown) @@ fun pool ->
+  Option.iter
+    (fun p -> Poller.add poller (Thread_pool.fd p) Poller.Flags.pollin)
+    pool;
+  { poller
+  ; (* At most one event per parked descriptor, plus the waker and the pool.
+       kqueue reports a descriptor's two directions separately, so a wait can
+       occasionally fill this and leave the remainder queued for the next
+       one. *)
+    events = Poller.Events.create (queue_depth + 2)
+  ; wakeup
+  ; pool
+  ; queue_depth
+  ; sq = Queue.create ()
+  ; cq = Queue.create ()
+  ; parked = Hashtbl.create 16
+  ; timers = Timer_heap.create ()
+  ; in_flight = 0
+  ; closed = false
+  }
 
 let check t = if t.closed then invalid_arg "Uringan: ring used after exit"
 let queue_depth t = t.queue_depth
@@ -177,6 +195,7 @@ let exit t =
       invalid_arg
         (Printf.sprintf "Uringan.exit: %d operation(s) in flight" t.in_flight);
     t.closed <- true;
+    Option.iter Thread_pool.shutdown t.pool;
     Waker.close t.wakeup;
     Poller.close t.poller
   end
@@ -252,32 +271,39 @@ let writev t ~file_offset fd bufs data =
   enqueue t (Io (Writev { fd; file_offset; bufs })) data
 
 let sync t f data = enqueue t (Io (Sync f)) data
+let blocking t f data = enqueue t (Blocking f) data
 
 let openat t ?dir_fd flags perm path data =
-  sync t (fun () -> Fs.openat dir_fd path flags perm) data
+  blocking t (fun () -> Fs.openat dir_fd path flags perm) data
 
 let close t fd data = enqueue t (Close fd) data
-let fsync t fd data = sync t (fun () -> Fs.fsync fd ~data_only:false) data
-let fdatasync t fd data = sync t (fun () -> Fs.fsync fd ~data_only:true) data
-let ftruncate t fd ~len data = sync t (fun () -> Fs.ftruncate fd len) data
+let fsync t fd data = blocking t (fun () -> Fs.fsync fd ~data_only:false) data
+
+let fdatasync t fd data =
+  blocking t (fun () -> Fs.fsync fd ~data_only:true) data
+
+let ftruncate t fd ~len data = blocking t (fun () -> Fs.ftruncate fd len) data
 
 let unlink t ~dir ?fd path data =
-  sync t (fun () -> Fs.unlinkat fd path ~dir) data
+  blocking t (fun () -> Fs.unlinkat fd path ~dir) data
 
 let mkdirat t ~mode ?fd path data =
-  sync t (fun () -> Fs.mkdirat fd path mode) data
+  blocking t (fun () -> Fs.mkdirat fd path mode) data
 
 let renameat t ?old_dir_fd old_path ?new_dir_fd new_path data =
-  sync t (fun () -> Fs.renameat old_dir_fd old_path new_dir_fd new_path) data
+  blocking
+    t
+    (fun () -> Fs.renameat old_dir_fd old_path new_dir_fd new_path)
+    data
 
 let linkat t ~follow ?old_dir_fd ~old_path ?new_dir_fd ~new_path data =
-  sync
+  blocking
     t
     (fun () -> Fs.linkat old_dir_fd old_path new_dir_fd new_path ~follow)
     data
 
 let symlinkat t ~target ?dir_fd ~link_path data =
-  sync t (fun () -> Fs.symlinkat target dir_fd link_path) data
+  blocking t (fun () -> Fs.symlinkat target dir_fd link_path) data
 
 module Stat = struct
   include Fs.Stat
@@ -308,7 +334,7 @@ module Stat = struct
 end
 
 let fstatat t ?fd ~follow path stat data =
-  sync t (fun () -> Fs.fstatat fd path ~follow stat) data
+  blocking t (fun () -> Fs.fstatat fd path ~follow stat) data
 
 let socket ?(cloexec = true) t domain ty protocol data =
   sync t (fun () -> Sock.socket ~cloexec domain ty protocol) data
@@ -360,7 +386,7 @@ let recv_msg t fd msg data = enqueue t (Io (Recv_msg { fd; msg })) data
 let cancel t job data =
   (match job.state with
   | Collected -> invalid_arg "Uringan.cancel: job already collected"
-  | Queued | Parked _ | Sleeping _ | Completed -> ());
+  | Queued | Parked _ | Sleeping _ | Offloaded _ | Completed -> ());
   enqueue t (Cancel job) data
 
 (* [perform io] runs the syscall for [io]: a non-negative result or a negative
@@ -524,6 +550,11 @@ let cancel_job t job target =
   | Sleeping e ->
     Timer_heap.remove t.timers e;
     cancelled ()
+  | Offloaded task ->
+    (* A call already running on a worker cannot be interrupted. *)
+    if Thread_pool.cancel task
+    then cancelled ()
+    else complete t job (Error Unix.EALREADY)
   | Completed | Collected -> complete t job (Error Unix.ENOENT)
   | Queued ->
     (* [target] was queued before [job], so [submit] has already attempted
@@ -541,6 +572,14 @@ let close_fd t fd =
   (try Poller.delete t.poller fd with Unix.Unix_error _ -> ());
   Fs.close fd
 
+(* [f] must not raise on a worker thread; the stubs only raise [Out_of_memory],
+   when copying a path. *)
+let run_blocking f =
+  match f () with
+  | n -> Res.of_syscall n
+  | exception Out_of_memory -> Error Unix.ENOMEM
+  | exception Unix.Unix_error (e, _, _) -> Error e
+
 let attempt t job =
   match job.op with
   | Io io -> attempt_io t job io
@@ -549,6 +588,12 @@ let attempt t job =
     job.state <- Sleeping (Timer_heap.add t.timers deadline job)
   | Cancel target -> cancel_job t job target
   | Close fd -> complete t job (Res.of_syscall (close_fd t fd))
+  | Blocking f ->
+    (match t.pool with
+    | Option.None -> complete t job (run_blocking f)
+    | Option.Some pool ->
+      job.state <-
+        Offloaded (Thread_pool.submit pool (fun () -> run_blocking f) job))
 
 let fire_timers t =
   if Timer_heap.length t.timers > 0
@@ -602,6 +647,11 @@ let on_ready t fd flags =
     if failed || mem pollout flags then retry t w.writers;
     rearm t fd w
 
+let is_pool t fd =
+  match t.pool with
+  | Option.Some p -> fd = Thread_pool.fd p
+  | Option.None -> false
+
 (* Wait up to [timeout_ms] for readiness and retry what became ready. Returns
    [true] if {!wakeup} was called. *)
 let poll t ~timeout_ms =
@@ -614,6 +664,8 @@ let poll t ~timeout_ms =
       ignore (Waker.drain t.wakeup : bool);
       woken := true
     end
+    else if is_pool t fd
+    then Option.iter (fun p -> Thread_pool.drain p (complete t)) t.pool
     else on_ready t fd (Poller.Events.flags t.events i)
   done;
   !woken
@@ -703,4 +755,5 @@ module Private = struct
   module Poller = Poller
   module Waker = Waker
   module Timer_heap = Timer_heap
+  module Thread_pool = Thread_pool
 end

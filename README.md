@@ -7,28 +7,6 @@ but implemented in term of epoll or kqueue, the implementation will read or writ
 
 The motivation is eventually use it for EIO scheduler.
 
-## Installation
-
-### Using Opam
-
-```bash
-opam install inquire
-```
-
-### Using Esy
-
-```bash
-esy add @opam/inquire
-```
-
-## Usage
-
-### In OCaml
-
-```ocaml
-let () = Uringan.greet "World"
-```
-
 ## Contributing
 
 Take a look at our [Contributing Guide](CONTRIBUTING.md).
