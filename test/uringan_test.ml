@@ -177,8 +177,8 @@ let test_waker_cross_domain () =
 
 let unix_error = testable (Fmt.of_to_string Unix.error_message) ( = )
 
-let with_ring ?(queue_depth = 16) f =
-  let t = Uringan.create ~queue_depth () in
+let with_ring ?fs_threads ?(queue_depth = 16) f =
+  let t = Uringan.create ?fs_threads ~queue_depth () in
   Fun.protect ~finally:(fun () -> Uringan.exit t) (fun () -> f t)
 
 let queue = function
@@ -1159,6 +1159,102 @@ let test_close_cancels_parked () =
   queue (Uringan.read t ~file_offset:current r' (Cstruct.create 4) 4);
   check_result "fresh read" 4 (Ok 1) (next t)
 
+(* A FIFO in a fresh directory. Opening it without [O_NONBLOCK] blocks until the
+   other end is opened, which gives a file system call that blocks for as long
+   as a test needs. *)
+let with_fifo f =
+  with_temp_dir @@ fun dir ->
+  let path = Filename.concat dir "fifo" in
+  Unix.mkfifo path 0o600;
+  f path
+
+(* Wait for a completion that returns a descriptor. *)
+let next_fd t =
+  match Uringan.wait ~timeout:1.0 t with
+  | Uringan.None -> fail "no completion"
+  | Uringan.Some { result; data } -> data, Uringan.Res.fd_exn result "openat" ""
+
+let open_fifo t path flags data =
+  Uringan.openat t (Unix.O_CLOEXEC :: flags) 0 path data
+
+let test_pool_does_not_block () =
+  with_ring ~fs_threads:2 @@ fun t ->
+  with_fifo @@ fun path ->
+  queue (open_fifo t path [ Unix.O_RDONLY ] 1);
+  queue (Uringan.noop t 2);
+  check_result "noop first" 2 (Ok 0) (next t);
+  expect_none t;
+  queue (open_fifo t path [ Unix.O_WRONLY ] 3);
+  let a = next_fd t
+  and b = next_fd t in
+  closing [ snd a; snd b ] @@ fun () ->
+  check
+    (list int)
+    "both ends open"
+    [ 1; 3 ]
+    (List.sort compare [ fst a; fst b ]);
+  check int "idle" 0 (Uringan.active_ops t)
+
+let test_cancel_running_fs_op () =
+  with_ring ~fs_threads:1 @@ fun t ->
+  with_fifo @@ fun path ->
+  let job = Option.get (open_fifo t path [ Unix.O_RDONLY ] 1) in
+  (* Give the worker time to start the open. *)
+  expect_none t;
+  queue (Uringan.cancel t job 2);
+  check_result "cancel" 2 (Error Unix.EALREADY) (next t);
+  (* A reader blocked in open counts as present. *)
+  let w = Unix.openfile path [ Unix.O_WRONLY; Unix.O_NONBLOCK ] 0 in
+  let r = next_fd t in
+  closing [ w; snd r ] @@ fun () -> check int "open completes" 1 (fst r)
+
+let test_cancel_queued_fs_op () =
+  with_ring ~fs_threads:1 @@ fun t ->
+  with_fifo @@ fun path ->
+  queue (open_fifo t path [ Unix.O_RDONLY ] 1);
+  expect_none t;
+  (* The only worker is busy, so this waits in the pool. *)
+  let st = Uringan.Stat.create () in
+  let job = Option.get (Uringan.fstatat t ~follow:true path st 2) in
+  ignore (Uringan.submit t : int);
+  queue (Uringan.cancel t job 3);
+  check_result "stat" 2 (Error Uringan.ecanceled) (next t);
+  check_result "cancel" 3 (Ok 0) (next t);
+  let w = Unix.openfile path [ Unix.O_WRONLY; Unix.O_NONBLOCK ] 0 in
+  let r = next_fd t in
+  closing [ w; snd r ] @@ fun () ->
+  check int "open completes" 1 (fst r);
+  (* The cancelled stat never runs. *)
+  expect_none t;
+  check int "idle" 0 (Uringan.active_ops t)
+
+let test_fs_parallel () =
+  with_ring ~fs_threads:3 @@ fun t ->
+  with_temp_dir @@ fun dir ->
+  let n = 12 in
+  let path i = Filename.concat dir (string_of_int i) in
+  for i = 1 to n do
+    queue (Uringan.mkdirat t ~mode:0o700 (path i) i)
+  done;
+  check
+    (list (pair int (result int unix_error)))
+    "all created"
+    (List.init n (fun i -> i + 1, Ok 0))
+    (List.map (fun (i, r) -> i, int_of r) (collect t n));
+  for i = 1 to n do
+    Unix.rmdir (path i)
+  done
+
+let test_fs_inline () =
+  with_ring ~fs_threads:0 @@ fun t ->
+  with_temp_dir @@ fun dir ->
+  queue (Uringan.mkdirat t ~mode:0o700 (Filename.concat dir "sub") 1);
+  match Uringan.get_cqe_nonblocking t with
+  | Uringan.None -> fail "not run inline"
+  | Uringan.Some { result; data } ->
+    check_result "inline" 1 (Ok 0) (data, int_of result);
+    Unix.rmdir (Filename.concat dir "sub")
+
 let suite =
   [ "poll mask", `Quick, test_poll_mask
   ; "now is monotonic", `Quick, test_now_monotonic
@@ -1217,6 +1313,11 @@ let file_suite =
   ; "open missing", `Quick, test_open_missing
   ; "directory ops", `Quick, test_dir_ops
   ; "close cancels parked", `Quick, test_close_cancels_parked
+  ; "pool does not block ring", `Quick, test_pool_does_not_block
+  ; "cancel running fs op", `Quick, test_cancel_running_fs_op
+  ; "cancel queued fs op", `Quick, test_cancel_queued_fs_op
+  ; "parallel fs ops", `Quick, test_fs_parallel
+  ; "fs_threads 0 runs inline", `Quick, test_fs_inline
   ]
 
 let socket_suite =

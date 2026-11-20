@@ -13,7 +13,7 @@
    clock_stubs)
   (extra_deps uringan_stubs.h config.h)
   (flags :standard -Wall -Wextra -Werror))
- (libraries unix cstruct optint)
+ (libraries unix threads.posix cstruct optint)
  (preprocess
   (pps ppx_optcomp))
  (preprocessor_deps config.h))
